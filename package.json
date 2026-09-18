@@ -1,0 +1,32 @@
+{
+  "name": "aequdash",
+  "version": "2.0.0",
+  "description": "aequdash — aequchain TUI v2. Calm, engineered instrument console for the aequchain ephemeral testnet. OpenTUI + React + Bun.",
+  "type": "module",
+  "module": "src/App.tsx",
+  "bin": {
+    "aequdash": "bin/aequdash.tsx"
+  },
+  "scripts": {
+    "start": "bun run bin/aequdash.tsx",
+    "start:sim": "AEQUCHAIN_SIMULATE=1 bun run bin/aequdash.tsx",
+    "dev": "bun --watch bin/aequdash.tsx",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test tests/",
+    "snapshot": "bun run scripts/snapshot.tsx",
+    "snapshot:all": "for s in dashboard identity networks businesses pledges node consensus console; do echo \"=== $s ===\"; SCREEN=$s bun run scripts/snapshot.tsx; done"
+  },
+  "dependencies": {
+    "@opentui/react": "^0.4.1",
+    "react": "19.2.2",
+    "react-dom": "19.2.2"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.1.10",
+    "@types/react": "^18.3.5",
+    "typescript": "^5.6.2"
+  },
+  "trustedDependencies": [
+    "@opentui/core"
+  ]
+}
