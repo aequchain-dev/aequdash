@@ -61,6 +61,7 @@ export interface TreasuryHolding {
   denom: string       // "AEQ" | "USDC" | "ETH" | "BTC" | "Other"
   amount_aeq: number  // value in AEQ terms
   is_native: boolean
+  pct?: number        // share of treasury (0..100) — present when backend computes it
 }
 
 export interface TreasuryV2 {
@@ -344,8 +345,34 @@ export interface SnapshotV2 {
   equality: EqualityReportV2 | null
   consensus: ConsensusTestV2 | null
   activity: ActivityEvent[]            // structured live feed (newest last)
+  /** Live mesh view — present when the backend is the aeqnet testnet. */
+  cluster?: ClusterInfo
   /** false when the backend is v1 Julia and v2 aggregates were derived locally. */
   full_fidelity: boolean
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Cluster (live ephemeral mesh — aeqnet backend)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface ClusterNodeInfo {
+  id: string
+  label: string
+  host: string
+  port: number
+  status: "live" | "down"
+  height: number
+  state_root: string
+  peers: number
+  uptime_s: number
+  version: string
+}
+
+export interface ClusterInfo {
+  self_id: string
+  mesh_size: number
+  all_converged: boolean
+  nodes: ClusterNodeInfo[]
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

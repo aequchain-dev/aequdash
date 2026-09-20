@@ -25,7 +25,7 @@ const { LIGHT } = await import("../src/lib/theme.ts")
 const React = await import("react")
 
 const setup = await createTestRenderer({ width: 158, height: 50, screenMode: "alternate-screen" })
-const bridge = new JuliaBridge({ juliaBin: "julia", rpcScript: "/dev/null", simulate: true, cwd: process.cwd() })
+const bridge = new JuliaBridge({ backend: "sim", juliaBin: "julia", rpcScript: "/dev/null", cwd: process.cwd(), aeqnetNodes: 1, aeqnetPort: 7920 })
 await bridge.start()
 
 const root = createRoot(setup.renderer)

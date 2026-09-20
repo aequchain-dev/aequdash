@@ -46,12 +46,20 @@ const KEY_TO_SCREEN: Record<string, ScreenId> = {
 }
 
 export function App() {
-  const { screen, setScreen, commandBarOpen, setCommandBarOpen, refresh } = useStore()
+  const { screen, setScreen, commandBarOpen, setCommandBarOpen, refresh, bridge } = useStore()
   const renderer = useRenderer()
   const { width } = useTerminalDimensions()
   const [showSplash, setShowSplash] = useState(
     process.env.AEQUCHAIN_NO_SPLASH !== "1" && process.env.AEQUDASH_SNAPSHOT !== "1",
   )
+
+  // Graceful full teardown: stop the backend (mesh shuts down cleanly),
+  // destroy the renderer (restores the terminal), then exit.
+  const quit = async () => {
+    try { await bridge.stop() } catch { /* ignore */ }
+    try { renderer.destroy() } catch { /* ignore */ }
+    process.exit(0)
+  }
 
   useKeyboard((key) => {
     if (commandBarOpen) return
@@ -59,8 +67,7 @@ export function App() {
     const name = key.name
 
     if (name === "q" || (key.ctrl && name === "c")) {
-      try { renderer.destroy() } catch {}
-      process.exit(0)
+      void quit()
       return
     }
 

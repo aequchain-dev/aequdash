@@ -14,7 +14,7 @@ import { Panel, panelInnerWidth } from "../components/Panel.tsx"
 import { DataRow, StatSplit } from "../components/DataRow.tsx"
 import { Table, type Column } from "../components/Table.tsx"
 import { T } from "../components/T.tsx"
-import type { NodeAccount, BlockV2 } from "../lib/types.ts"
+import type { NodeAccount, BlockV2, ClusterNodeInfo } from "../lib/types.ts"
 
 export function Node() {
   const { snapshot } = useStore()
@@ -36,12 +36,23 @@ export function Node() {
   }
 
   const m = node.metrics
+  const cluster = snapshot.cluster
 
   const acctCols: Column<NodeAccount>[] = [
     { key: "id", label: "Account", width: 14, render: (a) => a.id },
     { key: "bal", label: "Balance (AEQ)", width: 14, align: "right", render: (a) => fmt2(a.balance_aeq) },
     { key: "nonce", label: "Nonce", width: 7, align: "right", render: (a) => String(a.nonce) },
     { key: "head", label: "Head", width: 14, render: (a) => shortHash(a.head_hash) },
+  ]
+
+  const meshCols: Column<ClusterNodeInfo>[] = [
+    { key: "id", label: "Node", width: 14, render: (n) => n.id },
+    { key: "addr", label: "Address", width: 18, render: (n) => `${n.host}:${n.port}` },
+    { key: "status", label: "Status", width: 8, render: (n) => (n.status === "live" ? "LIVE" : "DOWN") },
+    { key: "height", label: "Height", width: 9, align: "right", render: (n) => fmt0(n.height) },
+    { key: "peers", label: "Peers", width: 7, align: "right", render: (n) => String(n.peers) },
+    { key: "root", label: "State Root", width: 16, render: (n) => shortHash(n.state_root) },
+    { key: "up", label: "Uptime", width: 8, align: "right", render: (n) => `${Math.floor(n.uptime_s / 60)}m${n.uptime_s % 60}s` },
   ]
 
   const blockCols: Column<BlockV2>[] = [
@@ -72,6 +83,19 @@ export function Node() {
           </Panel>
         </box>
         <box height={1} />
+        {cluster && (
+          <>
+            <Panel
+              title="Mesh"
+              meta={`${cluster.mesh_size} live node${cluster.mesh_size === 1 ? "" : "s"} · ${cluster.all_converged ? "converged" : "syncing"}`}
+              width={w}
+            >
+              <Table columns={meshCols} rows={cluster.nodes} rowKey={(n) => n.id} width={iw} maxRows={8} />
+              <T color={THEME.ink.faint}>{"node_stop <id> · node_start <id> · net_nodes — ephemeral: state vanishes when the mesh empties"}</T>
+            </Panel>
+            <box height={1} />
+          </>
+        )}
         <Panel title="Live Metrics" meta="Performance" width={w}>
           <StatSplit
             width={iw}

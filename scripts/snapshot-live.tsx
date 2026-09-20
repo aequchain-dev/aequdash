@@ -1,33 +1,25 @@
 /**
- * aequdash — scripts/snapshot.tsx
+ * aequdash — scripts/snapshot-live.tsx
  *
- * Headless deterministic snapshot harness (dev policy: scriptable/testable).
+ * Headless frame capture against the LIVE aeqnet mesh (not the simulator).
+ * Boots the real 3-node mesh, renders the app, captures the frame.
  *
- *   bun run scripts/snapshot.tsx                      # dashboard @ 158x50
- *   SCREEN=pledges bun run scripts/snapshot.tsx       # any screen
- *   WIDTH=100 HEIGHT=34 bun run scripts/snapshot.tsx  # responsive class B/C
- *   THEME=dark ...                                    # dark theme
- *
- * AEQUDASH_SNAPSHOT=1 freezes the simulator (no heartbeat, pinned clock),
- * so frames are byte-reproducible across runs.
- *
- * NOTE: env vars must be set BEFORE any src/ module loads (they read env at
- * module scope). ESM imports hoist, so everything below uses dynamic import.
+ *   bun run scripts/snapshot-live.tsx
+ *   SCREEN=node bun run scripts/snapshot-live.tsx
  */
 
-process.env.AEQUDASH_SNAPSHOT = "1"
-process.env.AEQUCHAIN_SIMULATE = "1"
 process.env.AEQUCHAIN_NO_SPLASH = "1"
-if (process.env.THEME) process.env.AEQUCHAIN_THEME = process.env.THEME
+process.env.AEQUCHAIN_NO_MOTION = "1"
 
 const SCREEN = process.env.SCREEN ?? "dashboard"
 const WIDTH = parseInt(process.env.WIDTH ?? "158")
 const HEIGHT = parseInt(process.env.HEIGHT ?? "50")
+const PORT = 23_000 + Math.floor(Math.random() * 2000)
 
 const { createTestRenderer } = await import("@opentui/core/testing")
 const { createRoot } = await import("@opentui/react")
 await import("@opentui/react/runtime-plugin-support")
-const { JuliaBridge } = await import("../src/lib/bridge.ts")
+const { Bridge } = await import("../src/lib/bridge.ts")
 const { BridgeProvider, useStore } = await import("../src/state/store.tsx")
 const { App } = await import("../src/App.tsx")
 const React = await import("react")
@@ -40,16 +32,22 @@ const setup = await createTestRenderer({
   screenMode: "alternate-screen",
 })
 
-const bridge = new JuliaBridge({
-  backend: "sim",
+const bridge = new Bridge({
+  backend: "aeqnet",
   juliaBin: "julia",
   rpcScript: "/dev/null",
   cwd: process.cwd(),
-  aeqnetNodes: 1,
-  aeqnetPort: 7920,
+  aeqnetNodes: 3,
+  aeqnetPort: PORT,
 })
 
 await bridge.start()
+
+// Wait for the mesh to be ready (genesis committed)
+const deadline = Date.now() + 45_000
+while (bridge.status !== "ready" && Date.now() < deadline) {
+  await new Promise((r) => setTimeout(r, 200))
+}
 
 function AppWithScreen({ screen }: { screen: string }) {
   const store = useStore()
@@ -67,12 +65,16 @@ root.render(
   ),
 )
 
-await new Promise((r) => setTimeout(r, 1200))
+// Let blocks flow so the frame shows a living chain
+await new Promise((r) => setTimeout(r, 6_000))
 await setup.flush({ maxPasses: 20 })
 await new Promise((r) => setTimeout(r, 300))
 
 const frame = setup.captureCharFrame()
 console.log(frame)
+
+const snap = await bridge.snapshot()
+console.error(`[live] backend=aeqnet height=${snap.block_height} members=${snap.members_summary?.total_registered} mesh=${snap.cluster?.mesh_size} converged=${snap.cluster?.all_converged} equality=${snap.equality?.all_passed}`)
 
 await bridge.stop()
 setup.renderer.destroy()

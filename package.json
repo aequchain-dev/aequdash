@@ -9,8 +9,10 @@
   },
   "scripts": {
     "start": "bun run bin/aequdash.tsx",
+    "start:julia": "AEQUCHAIN_BACKEND=julia bun run bin/aequdash.tsx",
     "start:sim": "AEQUCHAIN_SIMULATE=1 bun run bin/aequdash.tsx",
     "dev": "bun --watch bin/aequdash.tsx",
+    "node": "bun run src/node/gateway.ts",
     "typecheck": "tsc --noEmit",
     "test": "bun test tests/",
     "snapshot": "bun run scripts/snapshot.tsx",

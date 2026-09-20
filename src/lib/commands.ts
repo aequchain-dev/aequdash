@@ -36,6 +36,9 @@ export const COMMANDS: CommandDef[] = ([
   { name: "node_register", args: [{ name: "acct", required: true, description: "account id" }, { name: "balance", required: true, description: "initial balance" }], description: "Register a node account", screen: "node" },
   { name: "node_pay", args: [{ name: "from", required: true, description: "sender" }, { name: "to", required: true, description: "recipient" }, { name: "amount", required: true, description: "amount" }], description: "Submit a payment through the node", screen: "node" },
   { name: "node_status", args: [], description: "Show node status", screen: "node" },
+  { name: "node_stop", args: [{ name: "id", required: true, description: "node id (e.g. aeqnode-02)" }], description: "Stop a mesh node (ephemeral: state drops with it)", screen: "node" },
+  { name: "node_start", args: [{ name: "id", required: true, description: "node id (e.g. aeqnode-02)" }], description: "Start a stopped mesh node (fresh state, re-syncs)", screen: "node" },
+  { name: "net_nodes", args: [], description: "List live mesh nodes and their state roots", screen: "node" },
 
   // Consensus
   { name: "equality_check", args: [], description: "Run equality invariant check", screen: "consensus" },
@@ -46,6 +49,7 @@ export const COMMANDS: CommandDef[] = ([
   { name: "reset", args: [], description: "Reset state to demo defaults", screen: "dashboard" },
   { name: "status", args: [], description: "Show high-level status", screen: "dashboard" },
   { name: "help", args: [], description: "Show command help", screen: "dashboard" },
+  { name: "kill", args: [], aliases: ["shutdown", "quit", "exit"], description: "Shut down the mesh and exit (all nodes stop; state evaporates)", screen: "dashboard" },
 ] as CommandDef[]).map(c => ({
   ...c,
   aliases: c.name === "create_net" ? ["cn"]
@@ -55,7 +59,7 @@ export const COMMANDS: CommandDef[] = ([
     : c.name === "exit_member" ? ["ex"]
     : c.name === "equality_check" ? ["eq"]
     : c.name === "consensus_test" ? ["ct"]
-    : undefined,
+    : c.aliases,   // preserve aliases declared inline (e.g. kill → shutdown/quit/exit)
 }))
 
 export function commandsForScreen(screen: ScreenId): CommandDef[] {

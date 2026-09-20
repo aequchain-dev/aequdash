@@ -23,7 +23,7 @@ type ScreenId = import("../src/lib/types.ts").ScreenId
 
 async function renderFrame(screen: ScreenId, width: number, height: number): Promise<string> {
   const setup = await createTestRenderer({ width, height, screenMode: "alternate-screen" })
-  const bridge = new JuliaBridge({ juliaBin: "julia", rpcScript: "/dev/null", simulate: true, cwd: process.cwd() })
+  const bridge = new JuliaBridge({ backend: "sim", juliaBin: "julia", rpcScript: "/dev/null", cwd: process.cwd(), aeqnetNodes: 1, aeqnetPort: 7920 })
   await bridge.start()
 
   function AppWithScreen() {

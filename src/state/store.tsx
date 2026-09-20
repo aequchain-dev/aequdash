@@ -7,7 +7,7 @@
  */
 
 import { createContext, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react"
-import { JuliaBridge } from "../lib/bridge.ts"
+import { Bridge } from "../lib/bridge.ts"
 import type {
   ActivityEvent,
   BridgeStatus,
@@ -22,7 +22,7 @@ const IS_SNAPSHOT = process.env.AEQUDASH_SNAPSHOT === "1"
 export type { CommandResult }
 
 interface StoreValue {
-  bridge: JuliaBridge
+  bridge: Bridge
   status: BridgeStatus
   snapshot: SnapshotV2 | null
   activity: ActivityEvent[]
@@ -40,7 +40,7 @@ interface StoreValue {
 
 const Ctx = createContext<StoreValue | null>(null)
 
-export function BridgeProvider({ bridge, children }: { bridge: JuliaBridge; children: ReactNode }) {
+export function BridgeProvider({ bridge, children }: { bridge: Bridge; children: ReactNode }) {
   const [status, setStatus] = useState<BridgeStatus>(bridge.status)
   const [snapshot, setSnapshot] = useState<SnapshotV2 | null>(null)
   const [activity, setActivity] = useState<ActivityEvent[]>([])
@@ -122,12 +122,12 @@ export function BridgeProvider({ bridge, children }: { bridge: JuliaBridge; chil
     switch (status) {
       case "starting": return "STARTING"
       case "compiling": return "COMPILING"
-      case "ready": return "JULIA LIVE"
+      case "ready": return bridge.backend === "aeqnet" ? "TESTNET LIVE" : "JULIA LIVE"
       case "simulating": return "SIMULATION"
       case "error": return "ERROR"
       case "stopped": return "STOPPED"
     }
-  }, [status])
+  }, [status, bridge.backend])
 
   const value: StoreValue = {
     bridge,

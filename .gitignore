@@ -4,3 +4,8 @@ node_modules/
 dist/
 build/
 *.tsbuildinfo
+# Build artifacts
+aequdash
+aequdash.exe
+# Tooling state
+.serena/

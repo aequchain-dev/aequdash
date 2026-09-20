@@ -14,19 +14,36 @@ weight-and-whitespace typography. No neon, no gradients, no noise.
 ```bash
 cd aequdash
 bun install                    # first run only
-bun run start:sim              # simulator mode (no Julia required)
-bun run start                  # Julia backend if available, auto-fallback otherwise
+bun run start                  # REAL ephemeral testnet mesh (default — no sim)
+bun run start:julia            # Julia reference backend (if Julia installed)
+bun run start:sim              # deterministic simulator (explicit opt-in)
 ```
+
+**`bun run start` is real.** It spawns the aeqnet mesh: `node-1` in-process
+plus N−1 daemon nodes (`AEQUCHAIN_NODES`, default 3), linked over real TCP
+with rotating-proposer BFT consensus, Ed25519-signed votes, and exact
+BigInt-rational money. There is no simulator in the default path, and no
+silent fallback to one — if the mesh cannot boot, the TUI shows an honest
+error state instead of fabricated data.
+
+**Everything is ephemeral.** The mesh holds its state only in memory. Stop
+a node and its state drops with it (`node_stop aeqnode-02`); when the last
+live node stops, the network's entire state ceases to exist. `reset`
+re-genesis the mesh. Nothing is ever written to disk.
+
+**The mesh is observable.** Every node gossips its height and state root on
+1s heartbeats; the Node screen's Mesh panel shows every live node, its
+height, peers, and state root, so you can watch consensus converge.
 
 ## Development
 
 ```bash
 bun run dev                    # watch mode
 bun run typecheck              # zero-error TypeScript gate
-bun test                       # 79 tests: units, invariants, render smoke
+bun test                       # 139 tests: units, invariants, mesh e2e
 bun run snapshot               # deterministic headless frame (dashboard @ 158x50)
 bun run snapshot:all           # every screen
-bun scripts/verify-colors.tsx  # span-level palette verification (guide §30)
+bun run node -- --nodes 3      # bare mesh without the TUI (scriptable)
 ```
 
 ### Snapshot harness (scriptable / CI-safe)
@@ -45,6 +62,9 @@ frames are byte-reproducible across runs and machines.
 
 | Variable | Default | Purpose |
 |---|---|---|
+| `AEQUCHAIN_NODES` | `3` | Mesh size for the aeqnet backend |
+| `AEQUCHAIN_PORT` | `7920` | Base TCP port for the mesh |
+| `AEQUCHAIN_BACKEND` | `aeqnet` | `aeqnet` (default) or `julia` |
 | `AEQUCHAIN_SIMULATE` | unset | `1` forces the built-in simulator |
 | `AEQUCHAIN_THEME` | `light` | `light` (reference cream) or `dark` |
 | `AEQUCHAIN_NO_SPLASH` | unset | `1` skips the ≤900 ms startup splash |
@@ -61,10 +81,26 @@ frames are byte-reproducible across runs and machines.
 | `←` / `→` | Cycle screens |
 | `:` | Command bar |
 | `r` | Refresh snapshot |
-| `q` / `Ctrl-C` | Quit |
+| `q` / `Ctrl-C` | Quit (graceful: mesh shuts down first) |
 | `Esc` | Close command bar |
 | `↑` / `↓` | Command history |
 | Mouse | Nav rail clicks, wheel scroll |
+
+## Process tree & clean exit
+
+`bun run start` spawns the gateway (node-1) plus N−1 daemon nodes. The whole
+tree is self-cleaning: every layer watches its stdin, so when a parent dies
+— quit, Ctrl-C, or a hard kill — the children follow. **No orphans, ever.**
+
+- `q` / `Ctrl-C` — graceful quit (mesh shuts down, terminal restored)
+- `:kill` (aliases `:shutdown`, `:quit`, `:exit`) — bring the whole mesh
+  down from inside the TUI and exit
+- `:node_stop aeqnode-02` — stop one node (its state drops with it)
+- `:node_start aeqnode-02` — start it again (fresh state, re-syncs)
+- `:net_nodes` — list the live mesh
+
+Stale processes from older versions (pre-mesh) may still be running from
+before the self-cleaning tree existed — kill them once: `pkill -f aequdash`.
 
 ## Architecture
 
@@ -77,13 +113,25 @@ aequdash/
 ├── src/
 │   ├── App.tsx                 # frame shell + keyboard router
 │   ├── state/store.tsx         # BridgeProvider: status/snapshot/activity/clock
+│   ├── node/                   # THE EPHEMERAL TESTNET MESH (real backend)
+│   │   ├── rational.ts         #   exact BigInt rational arithmetic
+│   │   ├── ledger.ts           #   state machine; equality by construction
+│   │   ├── block.ts            #   blocks, merkle roots, tx ids
+│   │   ├── consensus.ts        #   BFT committee selection, votes, QCs
+│   │   ├── crypto.ts           #   SHA-256 + Ed25519 identities
+│   │   ├── p2p.ts              #   TCP mesh: handshake, heartbeat, gossip
+│   │   ├── node.ts             #   AequNode: mempool, proposals, commits
+│   │   ├── genesis.ts          #   deterministic genesis scenario
+│   │   ├── snapshot.ts         #   SnapshotV2 assembly from live state
+│   │   ├── daemon.ts           #   child-process node (stdio control)
+│   │   └── gateway.ts          #   JSON-RPC front door + cluster orchestration
 │   ├── lib/
 │   │   ├── theme.ts            # §5.1/§5.3 tokens, motion tokens, formatters
 │   │   ├── measure.ts          # terminal-cell width math (grapheme-safe)
 │   │   ├── layout.ts           # responsive classes A–E
 │   │   ├── types.ts            # SnapshotV2 — every pixel traces here
 │   │   ├── simulator.ts        # seeded deterministic reference backend
-│   │   ├── bridge.ts           # Julia JSON-RPC (piped stdio) + fallback
+│   │   ├── bridge.ts           # backend client: aeqnet | julia | sim
 │   │   └── commands.ts         # command catalog
 │   ├── components/
 │   │   ├── Panel.tsx           # [] Title ──── Meta frame grammar
@@ -95,20 +143,26 @@ aequdash/
 │   │   ├── Footer.tsx          # nav rail 1–8 + : command
 │   │   ├── CommandBar.tsx      # : layer with history + completion
 │   │   ├── Splash.tsx          # ≤900 ms quiet reveal
-│   │   └── StatusBadge.tsx     # JULIA LIVE / SIMULATION vocabulary
+│   │   └── StatusBadge.tsx     # TESTNET LIVE / JULIA LIVE / SIMULATION
 │   └── screens/                # Dashboard, Identity, Networks, Businesses,
 │                               # Pledges, Node, Consensus, Console
-└── tests/                      # 79 tests — format/measure/layout/sim/render
+└── tests/                      # 139 tests — format/measure/layout/sim/render
+                                #   + node: rational, ledger, consensus, mesh,
+                                #   bridge end-to-end
 ```
 
 ## Data honesty
 
-Every rendered value traces to `SnapshotV2` state. The simulator is the v2
-reference backend: seeded, deterministic, internally consistent
-(`member_value == treasury / members` holds exactly — full precision
-internally, quantization only at display). When driven by the real Julia
-backend, fields the legacy RPC cannot provide render as `—` rather than
-fabricated numbers (`full_fidelity: false`).
+Every rendered value traces to `SnapshotV2` state. Under the default aeqnet
+backend, every value traces further — to a committed block produced by real
+quorum consensus across the live mesh. The equality invariant
+
+    member_value == treasury / member_count
+
+holds exactly (BigInt rational arithmetic; member value is *derived*, never
+stored), and is verified continuously: every block carries a state-root
+digest that every node recomputes before voting. `equality_check` and the
+Consensus screen report live results, including per-member verification.
 
 ## License
 

@@ -11,6 +11,7 @@
  */
 
 import { useEffect, useRef, useState } from "react"
+import { useRenderer } from "@opentui/react"
 import { useStore } from "../state/store.tsx"
 import { THEME } from "../lib/theme.ts"
 import { COMMANDS } from "../lib/commands.ts"
@@ -20,7 +21,8 @@ import { T } from "./T.tsx"
 const HISTORY_CAP = 50
 
 export function CommandBar() {
-  const { commandBarOpen, setCommandBarOpen, call, lastCommand } = useStore()
+  const { commandBarOpen, setCommandBarOpen, call, lastCommand, bridge } = useStore()
+  const renderer = useRenderer()
   const [value, setValue] = useState("")
   const [history, setHistory] = useState<string[]>([])
   const [histIdx, setHistIdx] = useState(-1)
@@ -44,9 +46,20 @@ export function CommandBar() {
     const v = value.trim()
     if (!v) { setCommandBarOpen(false); return }
     setHistory((h) => [...h.slice(-HISTORY_CAP + 1), v])
+    const [cmd, ...args] = v.split(/\s+/)
+
+    // kill / shutdown / quit — bring the whole mesh down and exit cleanly.
+    // Every node stops (state evaporates), daemons exit, renderer restores
+    // the terminal, the process tree dies with zero orphans.
+    if (["kill", "shutdown", "quit", "exit"].includes(cmd.toLowerCase())) {
+      setCommandBarOpen(false)
+      try { await bridge.stop() } catch { /* ignore */ }
+      try { renderer.destroy() } catch { /* ignore */ }
+      process.exit(0)
+    }
+
     setRunning(true)
     try {
-      const [cmd, ...args] = v.split(/\s+/)
       await call(cmd, args)
     } finally {
       setRunning(false)
