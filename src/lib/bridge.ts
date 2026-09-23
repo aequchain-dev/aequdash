@@ -17,13 +17,17 @@
  *           requested (AEQUCHAIN_SIMULATE=1) or frozen for CI snapshots
  *           (AEQUDASH_SNAPSHOT=1).
  *
- * Wire protocol (aeqnet + julia): newline-delimited JSON-RPC over piped
- * stdio. Child stdout NEVER touches the parent terminal. Structured
- * activity arrives as JSON-RPC notifications: {"method":"activity",...}.
+ * Wire protocol (aeqnet + julia): newline-delimited JSON-RPC. Julia uses
+ * piped stdio; aeqnet uses a TCP control socket so that MULTIPLE TUI
+ * instances share ONE live mesh — the first `bun run start` spawns the
+ * detached gateway, later ones attach to it. The mesh evaporates when the
+ * last client disconnects. Structured activity arrives as JSON-RPC
+ * notifications: {"method":"activity",...}.
  */
 
 import { EventEmitter } from "node:events"
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process"
+import type { Socket } from "bun"
 import { AequSimulator, backendNowMs } from "./simulator.ts"
 import type {
   ActivityEvent,
@@ -41,6 +45,21 @@ export interface BridgeOptions {
   cwd: string
   aeqnetNodes: number
   aeqnetPort: number
+  /**
+   * Optional remote gateway "host:port" to attach to instead of spawning a
+   * local mesh. Enables cross-machine sharing: point every user's TUI at one
+   * host machine's gateway and they all share one chain.
+   */
+  remoteGateway?: string
+  /**
+   * Interface the local control server binds to when this instance spawns the
+   * gateway. Default 127.0.0.1. Set to 0.0.0.0 to accept remote terminals.
+   */
+  controlHost?: string
+  /** Shared secret for authenticating to the gateway (AEQUCHAIN_TOKEN). */
+  token?: string
+  /** Use TLS when attaching to the gateway (required for internet exposure). */
+  tls?: boolean
 }
 
 interface PendingRequest {
@@ -53,23 +72,36 @@ interface PendingRequest {
 const REQUEST_TIMEOUT_MS = 30_000
 const STARTUP_TIMEOUT_MS = 90_000
 const ACTIVITY_BUFFER_CAP = 500
+const ATTACH_PROBE_MS = 5_000   // generous for remote/internet round-trips
+
+/** Thrown when a gateway is reachable but rejects our auth token — fatal. */
+class AuthRejected extends Error {}
 
 export class Bridge extends EventEmitter {
   readonly options: BridgeOptions
   readonly backend: BridgeBackend
   status: BridgeStatus = "starting"
   private proc: ChildProcessWithoutNullStreams | null = null
+  private sock: Socket | null = null
   private sim: AequSimulator | null = null
   private nextId = 1
   private pending = new Map<number, PendingRequest>()
   private stdoutBuf = ""
   private stderrBuf = ""
+  private sockBuf = ""
   private activityBuffer: ActivityEvent[] = []
+  /** True once the aeqnet gateway has announced readiness over the wire. */
+  private meshReady = false
 
   constructor(opts: BridgeOptions) {
     super()
     this.options = opts
     this.backend = opts.backend
+  }
+
+  /** The shared-mesh control port for aeqnet (derived from the mesh base port). */
+  private get controlPort(): number {
+    return this.options.aeqnetPort + 1000
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -85,16 +117,7 @@ export class Bridge extends EventEmitter {
         "Julia",
         { JULIA_LOAD_PATH: "@:@v#.#:@stdlib" },
       )
-      case "aeqnet": return this.startProcess(
-        process.execPath, // the bun binary running us
-        [
-          "run", gatewayScript(),
-          "--nodes", String(this.options.aeqnetNodes),
-          "--port", String(this.options.aeqnetPort),
-        ],
-        "aeqnet",
-        {},
-      )
+      case "aeqnet": return this.startAeqnetMesh()
     }
   }
 
@@ -106,6 +129,170 @@ export class Bridge extends EventEmitter {
     this.emitRaw("For the real ephemeral testnet mesh: bun run start (no AEQUCHAIN_SIMULATE).", "stdout", "info")
     this.emitRaw("rpc: hello — simulator ready", "rpc", "success")
     this.sim.start((ev) => this.emit("activity", ev))
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // aeqnet — shared ephemeral mesh over a TCP control socket
+  //
+  // The first `bun run start` spawns a DETACHED gateway that owns the mesh and
+  // serves JSON-RPC on a well-known control port. Every subsequent TUI simply
+  // ATTACHES to that same gateway, so all terminals see one shared chain.
+  // The mesh evaporates when the last client disconnects (gateway-side rule).
+  // ─────────────────────────────────────────────────────────────────────────
+
+  private async startAeqnetMesh(): Promise<void> {
+    this.setStatus("starting")
+
+    // ── Remote-attach mode: point at another machine's gateway, never spawn.
+    if (this.options.remoteGateway) {
+      const { host, port } = parseHostPort(this.options.remoteGateway, this.controlPort)
+      this.emitRaw(`Attaching to remote aeqnet mesh at ${host}:${port}…`, "stdout", "info")
+      const deadline = Date.now() + STARTUP_TIMEOUT_MS
+      while (Date.now() < deadline) {
+        try {
+          if (await this.tryAttach(host, port)) {
+            this.emitRaw(`Attached to remote aeqnet mesh at ${host}:${port}`, "rpc", "success")
+            return
+          }
+        } catch (e) {
+          if (e instanceof AuthRejected) {
+            return this.failBackend("gateway rejected the auth token (check AEQUCHAIN_TOKEN)")
+          }
+          throw e
+        }
+        await new Promise((r) => setTimeout(r, 400))
+      }
+      return this.failBackend(
+        `could not reach remote gateway at ${host}:${port}. ` +
+        `On the host machine, run with AEQUCHAIN_CONTROL_HOST=0.0.0.0 and open the port.`,
+      )
+    }
+
+    // ── Local shared mesh: attach if running, else spawn + attach.
+    let rejected = false
+    try {
+      if (await this.tryAttach("127.0.0.1", this.controlPort)) {
+        this.emitRaw(`Attached to live aeqnet mesh on 127.0.0.1:${this.controlPort}`, "rpc", "success")
+        return
+      }
+    } catch (e) {
+      if (e instanceof AuthRejected) rejected = true
+      else throw e
+    }
+    if (rejected) {
+      return this.failBackend(
+        "a live gateway on this port requires a token. Set AEQUCHAIN_TOKEN, or kill the gateway to start fresh.",
+      )
+    }
+    this.emitRaw(`No live mesh on port ${this.controlPort} — spawning shared gateway…`, "stdout", "info")
+    this.spawnGateway()
+    const deadline = Date.now() + STARTUP_TIMEOUT_MS
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 300))
+      try {
+        if (await this.tryAttach("127.0.0.1", this.controlPort)) {
+          this.emitRaw(`Spawned and attached to aeqnet mesh on 127.0.0.1:${this.controlPort}`, "rpc", "success")
+          return
+        }
+      } catch (e) {
+        if (e instanceof AuthRejected) {
+          return this.failBackend("gateway rejected the auth token (check AEQUCHAIN_TOKEN)")
+        }
+        throw e
+      }
+    }
+    this.failBackend("gateway did not come up in time")
+  }
+
+  /** Spawn the shared gateway as a detached process that serves the control port. */
+  private spawnGateway(): void {
+    const controlHost = this.options.controlHost ?? "127.0.0.1"
+    const proc = spawn(process.execPath, [
+      "run", gatewayScript(),
+      "--nodes", String(this.options.aeqnetNodes),
+      "--port", String(this.options.aeqnetPort),
+      "--serve", String(this.controlPort),
+      "--control-host", controlHost,
+    ], {
+      cwd: this.options.cwd,
+      stdio: ["ignore", "ignore", "ignore"],
+      detached: true,           // own process group — survives the spawning TUI
+      env: { ...process.env },
+    })
+    proc.unref()                // let us exit without waiting for it
+  }
+
+  /**
+   * Try to open a TCP connection to a gateway. On success, wire up the socket,
+   * authenticate if a token is configured, and return true. Returns false if
+   * nothing is listening yet. Throws AuthRejected if the gateway is reachable
+   * but refuses our token (fatal — retrying won't help).
+   */
+  private tryAttach(host: string, port: number): Promise<boolean> {
+    return new Promise((resolve, reject) => {
+      let settled = false
+      const done = (ok: boolean) => { if (!settled) { settled = true; resolve(ok) } }
+      const failAuth = () => { if (!settled) { settled = true; reject(new AuthRejected()) } }
+      try {
+        Bun.connect({
+          hostname: host,
+          port,
+          ...(this.options.tls ? { tls: { rejectUnauthorized: false } } : {}),
+          socket: {
+            open: (sock) => {
+              this.sock = sock
+              // If the gateway requires a token, authenticate before serving.
+              // Then issue a net.nodes probe — this registers us as a client
+              // on the gateway and confirms the mesh is alive.
+              const probe = () => this.call("net.nodes", undefined, ATTACH_PROBE_MS - 1_000)
+                .then(() => done(true))
+                .catch((e: Error) => {
+                  if (/invalid token|unauthorized|auth/i.test(e.message)) failAuth()
+                  else done(false)
+                })
+              if (this.options.token) {
+                this.call("auth", { token: this.options.token }, ATTACH_PROBE_MS - 1_000)
+                  .then(() => probe())
+                  .catch((e: Error) => {
+                    // Explicit "invalid token" from the gateway is fatal; a
+                    // timeout/transport error just means "not ready yet".
+                    if (/invalid token|unauthorized/i.test(e.message)) failAuth()
+                    else done(false)
+                  })
+              } else {
+                probe()
+              }
+            },
+            data: (_sock, chunk) => this.onSocketData(chunk),
+            close: () => this.onSocketClosed(),
+            error: () => this.onSocketClosed(),
+            connectError: () => { done(false) },
+          },
+        }).catch(() => done(false))
+      } catch {
+        done(false)
+      }
+      // Hard cap on the connect attempt
+      setTimeout(() => done(false), ATTACH_PROBE_MS)
+    })
+  }
+
+  private onSocketData(chunk: Uint8Array): void {
+    this.sockBuf += new TextDecoder().decode(chunk)
+    let nl: number
+    while ((nl = this.sockBuf.indexOf("\n")) >= 0) {
+      const line = this.sockBuf.slice(0, nl)
+      this.sockBuf = this.sockBuf.slice(nl + 1)
+      this.handleLine(line, "stdout")
+    }
+  }
+
+  private onSocketClosed(): void {
+    this.sock = null
+    if (this.status !== "stopped") {
+      this.emitRaw("aeqnet mesh connection closed (mesh evaporated)", "stderr", "warn")
+      this.setStatus("stopped")
+    }
   }
 
   private async startProcess(
@@ -181,6 +368,14 @@ export class Bridge extends EventEmitter {
   async stop(): Promise<void> {
     this.setStatus("stopped")
     if (this.sim) { this.sim.stop(); this.sim = null }
+    // aeqnet: detach this client from the shared mesh. The gateway owns the
+    // mesh and evaporates it only when the LAST client disconnects — so a
+    // single TUI quitting leaves a shared mesh alive for the others.
+    if (this.sock) {
+      try { this.sock.end() } catch { /* ignore */ }
+      this.sock = null
+      return
+    }
     if (!this.proc) return
     try { this.proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 0, method: "shutdown" }) + "\n") } catch { /* ignore */ }
     await new Promise((r) => setTimeout(r, 50))
@@ -190,7 +385,27 @@ export class Bridge extends EventEmitter {
     this.proc = null
   }
 
-  kill(): void { try { this.proc?.kill("SIGKILL") } catch { /* ignore */ } }
+  kill(): void {
+    if (this.sock) { try { this.sock.end() } catch { /* ignore */ } ; this.sock = null; return }
+    try { this.proc?.kill("SIGKILL") } catch { /* ignore */ }
+  }
+
+  /**
+   * Bring the WHOLE shared mesh down (the `:kill` command). Unlike stop() —
+   * which only detaches this client — this instructs the gateway to tear down
+   * every node, evaporating the shared state for all attached clients.
+   */
+  async terminateMesh(): Promise<void> {
+    this.setStatus("stopped")
+    if (this.sim) { this.sim.stop(); this.sim = null; return }
+    if (this.sock) {
+      try { await this.call("shutdown", undefined, 3_000) } catch { /* ignore */ }
+      try { this.sock.end() } catch { /* ignore */ }
+      this.sock = null
+      return
+    }
+    await this.stop()
+  }
 
   // ─────────────────────────────────────────────────────────────────────────
   // JSON-RPC client
@@ -220,7 +435,7 @@ export class Bridge extends EventEmitter {
       if (method === "shutdown") return undefined as unknown as T
       throw new Error(`unknown method: ${method}`)
     }
-    if (!this.proc) throw new Error(`backend "${this.backend}" not running`)
+    if (!this.proc && !this.sock) throw new Error(`backend "${this.backend}" not running`)
 
     const id = this.nextId++
     const req = { jsonrpc: "2.0", id, method, params }
@@ -234,7 +449,9 @@ export class Bridge extends EventEmitter {
         reject, method, started: Date.now(),
       })
     })
-    this.proc.stdin.write(JSON.stringify(req) + "\n")
+    const line = JSON.stringify(req) + "\n"
+    if (this.sock) this.sock.write(line)
+    else this.proc!.stdin.write(line)
     return promise
   }
 
@@ -331,6 +548,23 @@ export class Bridge extends EventEmitter {
         // JSON-RPC notification (no id) — structured activity from the backend
         if (msg.method === "activity" && msg.params) {
           const ev = msg.params as ActivityEvent
+          // The gateway demands a token we don't have → fail fast with a clear
+          // message instead of hanging at "starting" until the boot timeout.
+          if (/auth required/i.test(ev.message) && !this.options.token) {
+            this.failBackend(
+              "this gateway requires a token. Set AEQUCHAIN_TOKEN to the shared secret.",
+            )
+            return
+          }
+          // Over the aeqnet TCP control socket, the readiness hello arrives as
+          // an activity event (not a raw stdout line), so detect it here.
+          if (
+            (this.status === "starting" || this.status === "compiling") &&
+            /rpc:\s*hello|gateway ready|mesh.*ready/i.test(ev.message)
+          ) {
+            this.meshReady = true
+            this.setStatus("ready")
+          }
           this.emitActivity({ ...ev, ts: ev.ts ?? new Date(backendNowMs()).toISOString() })
           return
         }
@@ -403,4 +637,16 @@ export { Bridge as JuliaBridge }
 
 function gatewayScript(): string {
   return new URL("../node/gateway.ts", import.meta.url).pathname
+}
+
+/** Parse "host:port" | "host" into a connect target (default port if omitted). */
+function parseHostPort(addr: string, defaultPort: number): { host: string; port: number } {
+  const trimmed = addr.trim()
+  const idx = trimmed.lastIndexOf(":")
+  if (idx > 0) {
+    const host = trimmed.slice(0, idx)
+    const port = parseInt(trimmed.slice(idx + 1), 10)
+    if (host && Number.isFinite(port)) return { host, port }
+  }
+  return { host: trimmed, port: defaultPort }
 }

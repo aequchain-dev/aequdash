@@ -48,10 +48,17 @@ export function CommandBar() {
     setHistory((h) => [...h.slice(-HISTORY_CAP + 1), v])
     const [cmd, ...args] = v.split(/\s+/)
 
-    // kill / shutdown / quit — bring the whole mesh down and exit cleanly.
-    // Every node stops (state evaporates), daemons exit, renderer restores
-    // the terminal, the process tree dies with zero orphans.
-    if (["kill", "shutdown", "quit", "exit"].includes(cmd.toLowerCase())) {
+    // kill / shutdown — bring the WHOLE shared mesh down (every node stops,
+    // state evaporates for all attached terminals) and exit. quit / exit —
+    // detach this client only; the mesh survives for other attached terminals
+    // and evaporates when the last one leaves.
+    if (["kill", "shutdown"].includes(cmd.toLowerCase())) {
+      setCommandBarOpen(false)
+      try { await bridge.terminateMesh() } catch { /* ignore */ }
+      try { renderer.destroy() } catch { /* ignore */ }
+      process.exit(0)
+    }
+    if (["quit", "exit"].includes(cmd.toLowerCase())) {
       setCommandBarOpen(false)
       try { await bridge.stop() } catch { /* ignore */ }
       try { renderer.destroy() } catch { /* ignore */ }

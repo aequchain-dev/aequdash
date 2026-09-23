@@ -71,8 +71,14 @@ describe("aeqnet bridge (the `bun run start` path)", () => {
 
     const start = await bridge.runCommand("node_start", ["aeqnode-02"])
     expect(start.ok).toBe(true)
-    await new Promise((r) => setTimeout(r, 2_500))
-    const restored = await bridge.call<{ mesh_size: number }>("net.nodes")
+    // Node restart is async (rebind + redial + handshake + consensus resume).
+    // Poll for restoration rather than assuming a fixed delay.
+    const restoreDeadline = Date.now() + 15_000
+    let restored = await bridge.call<{ mesh_size: number }>("net.nodes")
+    while (restored.mesh_size !== 3 && Date.now() < restoreDeadline) {
+      await new Promise((r) => setTimeout(r, 250))
+      restored = await bridge.call<{ mesh_size: number }>("net.nodes")
+    }
     expect(restored.mesh_size).toBe(3)
   }, 90_000)
 })

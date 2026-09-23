@@ -379,7 +379,7 @@ function LoadingDashboard() {
   const label =
     status === "starting" ? "starting julia" :
     status === "compiling" ? "compiling packages" :
-    status === "error" ? "falling back to simulation" :
+    status === "error" ? "backend error — no fallback" :
     "connecting"
   const { width: tw } = useTerminalDimensions()
   const w = Math.max(24, tw - 6)

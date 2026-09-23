@@ -40,6 +40,16 @@ const JULIA_BIN = process.env.AEQUCHAIN_JULIA || "julia"
 const RPC_SCRIPT = process.env.AEQUCHAIN_RPC || new URL("../../julia/rpc-server.jl", import.meta.url).pathname
 const AEQUCHAIN_NODES = Math.max(1, parseInt(process.env.AEQUCHAIN_NODES ?? "3", 10))
 const AEQUCHAIN_PORT = Math.max(1024, parseInt(process.env.AEQUCHAIN_PORT ?? "7920", 10))
+// Cross-machine sharing: attach this TUI to another machine's gateway
+// (e.g. AEQUCHAIN_GATEWAY=192.168.1.10:8920 or a Tailscale/WireGuard IP).
+const AEQUCHAIN_REMOTE_GATEWAY = process.env.AEQUCHAIN_GATEWAY || undefined
+// When this instance spawns the gateway, which interface the control server
+// binds to. Default localhost; set 0.0.0.0 to accept remote terminals.
+const AEQUCHAIN_CONTROL_HOST = process.env.AEQUCHAIN_CONTROL_HOST || undefined
+// Internet safety for the control socket: a shared secret (required of every
+// client) and optional TLS encryption.
+const AEQUCHAIN_TOKEN = process.env.AEQUCHAIN_TOKEN || undefined
+const AEQUCHAIN_TLS = process.env.AEQUCHAIN_TLS === "1"
 
 if (!isTTY && BACKEND === "sim" && !process.env.AEQUCHAIN_ALLOW_NO_TTY) {
   // Snapshot/CI path — allowed headless without the flag
@@ -57,6 +67,10 @@ async function main() {
     cwd: process.cwd(),
     aeqnetNodes: AEQUCHAIN_NODES,
     aeqnetPort: AEQUCHAIN_PORT,
+    remoteGateway: AEQUCHAIN_REMOTE_GATEWAY,
+    controlHost: AEQUCHAIN_CONTROL_HOST,
+    token: AEQUCHAIN_TOKEN,
+    tls: AEQUCHAIN_TLS,
   })
 
   await bridge.start()
