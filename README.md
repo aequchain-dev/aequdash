@@ -66,13 +66,13 @@ public interface must require a shared token and (recommended) TLS:
 openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
   -keyout key.pem -out cert.pem -subj "/CN=aeqnet"
 AEQUCHAIN_CONTROL_HOST=0.0.0.0 \
-AEQUCHAIN_TOKEN="pick-a-long-random-secret" \
+AEQUCHAIN_TOKEN="testnet" \
 AEQUCHAIN_TLS_CERT=cert.pem AEQUCHAIN_TLS_KEY=key.pem \
   bun run start
 
 # Every other machine — present the same token, over TLS
 AEQUCHAIN_GATEWAY=host.example.com:8920 \
-AEQUCHAIN_TOKEN="pick-a-long-random-secret" \
+AEQUCHAIN_TOKEN="testnet" \
 AEQUCHAIN_TLS=1 \
   bun run start
 ```
