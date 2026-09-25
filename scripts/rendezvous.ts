@@ -19,6 +19,7 @@
  */
 
 import { Registry } from "../src/node/registry.ts"
+import { discoverPublicIPv4, guessOutboundHost } from "../src/node/netaddr.ts"
 
 let port = 8930
 let host = "0.0.0.0"
@@ -40,6 +41,17 @@ if (!server) {
 }
 
 console.log(`aeqnet rendezvous listening on ${host}:${server.port} (ttl=${parseInt(process.env.AEQUCHAIN_RDV_TTL_MS ?? "90000", 10) / 1000}s, auth=${process.env.AEQUCHAIN_RDV_TOKEN ? "on" : "off"})`)
+
+// Seamlessness is the product: don't make the operator look up an IP either.
+// Discover our public address and print the exact command peers should run.
+const publicIp = await discoverPublicIPv4()
+const shareHost = publicIp ?? guessOutboundHost()
+console.log(`\nshare this with peers:\n\n  AEQUCHAIN_RENDEZVOUS=${shareHost}:${server.port} bun run start\n`)
+if (publicIp) {
+  console.log(`(port ${server.port}/TCP must be reachable from the internet: firewall rule + router port-forward if this host is behind NAT)`)
+} else {
+  console.log(`(no public IPv4 discovered — the address above is this machine's LAN address. Internet peers need port ${server.port}/TCP forwarded to this machine, or run this on a VPS)`)
+}
 
 process.on("SIGINT", () => { registry.stop(); process.exit(0) })
 process.on("SIGTERM", () => { registry.stop(); process.exit(0) })
