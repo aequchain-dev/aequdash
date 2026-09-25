@@ -17,6 +17,7 @@
 
 import type { Socket } from "bun"
 import type { MeshMessage, PeerInfo } from "./proto.ts"
+import { sha256hex } from "./crypto.ts"
 
 const MAX_FRAME = 4 * 1024 * 1024        // 4 MiB frame cap
 const HEARTBEAT_MS = 1_000
@@ -31,6 +32,7 @@ export interface PeerState {
   pub: string
   height: number
   stateRoot: string
+  tipHash: string
   roster: string[]
   lastSeenMs: number
   connectedAt: number
@@ -55,10 +57,47 @@ export interface MeshOptions {
   seeds: { host: string; port: number }[]
   getHeight: () => number
   getStateRoot: () => string
+  getTipHash: () => string
   getRoster: () => string[]
   callbacks: MeshCallbacks
   heartbeatMs?: number
   nowFn?: () => number
+  /**
+   * Optional network token (invite-gated admission). When set, every hello /
+   * hello_ack must present HMAC-equivalent proof sha256("aequchain:netauth:"
+   * + genesisHash + ":" + token) or the socket is dropped before registration.
+   * This is the Sybil gate for internet-open meshes; the mesh genesis hash
+   * binds the proof to ONE network so tokens can't be replayed across chains.
+   */
+  token?: string
+  /**
+   * Optional TLS for ALL mesh links (this node is both server and client):
+   *   - listen with the given cert/key (PEM content or a file path)
+   *   - dial with TLS, accept self-signed certs (testnet trust model, same
+   *     stance as the gateway control socket)
+   * All nodes of a network must agree on TLS on/off — a plaintext peer's
+   * bytes fail TLS negotiation and the connection dies. That failure is the
+   * honest signal.
+   */
+  tls?: { cert: string; key: string }
+}
+
+/** Accept PEM content directly, or a path (loaded via Bun.file). */
+function tlsMaterial(v: string): string | ReturnType<typeof Bun.file> {
+  return v.includes("-----BEGIN") ? v : Bun.file(v)
+}
+
+/** Proof-of-knowledge of the network token, bound to the chain's genesis. */
+export function netAuthProof(genesisHash: string, token: string): string {
+  return sha256hex(`aequchain:netauth:${genesisHash}:${token}`)
+}
+
+/** Constant-time-ish string compare (token proof verification). */
+function safeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false
+  let diff = 0
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i)
+  return diff === 0
 }
 
 export class PeerMesh {
@@ -83,6 +122,9 @@ export class PeerMesh {
     const server = Bun.listen<undefined>({
       hostname: host,
       port,
+      ...(this.opts.tls
+        ? { tls: { cert: tlsMaterial(this.opts.tls.cert), key: tlsMaterial(this.opts.tls.key) } }
+        : {}),
       socket: {
         data: (sock, data) => this.onData(sock, data),
         open: (sock) => { this.pending.add(sock) },
@@ -161,6 +203,7 @@ export class PeerMesh {
       Bun.connect({
         hostname: host,
         port,
+        ...(this.opts.tls ? { tls: { rejectUnauthorized: false } } : {}),
         socket: {
           data: (sock, data) => this.onData(sock, data),
           open: (sock) => {
@@ -176,6 +219,8 @@ export class PeerMesh {
               state_root: this.opts.getStateRoot(),
               genesis_hash: this.opts.genesisHash,
               roster: this.opts.getRoster(),
+              tip_hash: this.opts.getTipHash(),
+              ...(this.opts.token ? { auth: netAuthProof(this.opts.genesisHash, this.opts.token) } : {}),
             })
             clearTimeout(timer)
             done(true)
@@ -220,16 +265,16 @@ export class PeerMesh {
       case "hello": return this.onHello(sock, msg)
       case "hello_ack": return this.onHelloAck(sock, msg)
       case "ping": {
-        this.updateLiveness(sock, msg.id, msg.height, msg.state_root, msg.roster)
+        this.updateLiveness(sock, msg.id, msg.height, msg.state_root, msg.tip_hash ?? "", msg.roster)
         this.sendRaw(sock, {
           type: "pong", id: this.opts.nodeId, ts: msg.ts,
           height: this.opts.getHeight(), state_root: this.opts.getStateRoot(),
-          roster: this.opts.getRoster(),
+          roster: this.opts.getRoster(), tip_hash: this.opts.getTipHash(),
         })
         return
       }
       case "pong": {
-        this.updateLiveness(sock, msg.id, msg.height, msg.state_root, msg.roster)
+        this.updateLiveness(sock, msg.id, msg.height, msg.state_root, msg.tip_hash ?? "", msg.roster)
         return
       }
       case "bye": {
@@ -267,7 +312,16 @@ export class PeerMesh {
       return
     }
     if (msg.id === this.opts.nodeId) { try { sock.end() } catch {}; return }
-    this.registerPeer(sock, msg.id, msg.host, msg.port, msg.pub, msg.height, msg.state_root, msg.roster, false)
+    // Token gate: when this mesh is invite-gated, the peer must prove the token.
+    if (this.opts.token && !safeEqual(msg.auth ?? "", netAuthProof(this.opts.genesisHash, this.opts.token))) {
+      try { sock.end() } catch {}
+      return
+    }
+    // ORDER MATTERS: the hello_ack must hit the wire BEFORE registerPeer
+    // fires onPeerUp. The dialer registers us only on hello_ack; if our
+    // onPeerUp handler sends anything to the dialer first (e.g. a fork-heal
+    // sync_request after wiping our chain), it would arrive before the ack
+    // and be dropped as unregistered. Same socket ⇒ ordered delivery.
     this.sendRaw(sock, {
       type: "hello_ack",
       id: this.opts.nodeId,
@@ -277,17 +331,25 @@ export class PeerMesh {
       height: this.opts.getHeight(),
       state_root: this.opts.getStateRoot(),
       roster: this.opts.getRoster(),
+      tip_hash: this.opts.getTipHash(),
+      ...(this.opts.token ? { auth: netAuthProof(this.opts.genesisHash, this.opts.token) } : {}),
     })
+    this.registerPeer(sock, msg.id, msg.host, msg.port, msg.pub, msg.height, msg.state_root, msg.tip_hash ?? "", msg.roster, false)
   }
 
   private onHelloAck(sock: PeerSocket, msg: Extract<MeshMessage, { type: "hello_ack" }>): void {
     if (msg.id === this.opts.nodeId) { try { sock.end() } catch {}; return }
-    this.registerPeer(sock, msg.id, msg.host, msg.port, msg.pub, msg.height, msg.state_root, msg.roster, true)
+    // Mutual proof: the answering peer must also know the token.
+    if (this.opts.token && !safeEqual(msg.auth ?? "", netAuthProof(this.opts.genesisHash, this.opts.token))) {
+      try { sock.end() } catch {}
+      return
+    }
+    this.registerPeer(sock, msg.id, msg.host, msg.port, msg.pub, msg.height, msg.state_root, msg.tip_hash ?? "", msg.roster, true)
   }
 
   private registerPeer(
     sock: PeerSocket, id: string, host: string, port: number, pub: string,
-    height: number, stateRoot: string, roster: string[], outbound: boolean,
+    height: number, stateRoot: string, tipHash: string, roster: string[], outbound: boolean,
   ): void {
     this.pending.delete(sock)
     const existing = this.peers.get(id)
@@ -298,7 +360,7 @@ export class PeerMesh {
     }
     const peer: PeerState = {
       id, host, port, pub,
-      height, stateRoot, roster,
+      height, stateRoot, tipHash, roster,
       lastSeenMs: this.now(),
       connectedAt: this.now(),
       socket: sock,
@@ -309,12 +371,13 @@ export class PeerMesh {
     this.opts.callbacks.onPeerUp(peer)
   }
 
-  private updateLiveness(sock: PeerSocket, id: string, height: number, stateRoot: string, roster: string[]): void {
+  private updateLiveness(sock: PeerSocket, id: string, height: number, stateRoot: string, tipHash: string, roster: string[]): void {
     const peer = this.bySocket.get(sock)
     if (!peer || peer.id !== id) return
     peer.lastSeenMs = this.now()
     peer.height = height
     peer.stateRoot = stateRoot
+    if (tipHash) peer.tipHash = tipHash
     peer.roster = roster
   }
 
@@ -356,7 +419,7 @@ export class PeerMesh {
         peer.socket?.write(encodeFrame({
           type: "ping", id: this.opts.nodeId, ts: now,
           height: this.opts.getHeight(), state_root: this.opts.getStateRoot(),
-          roster: this.opts.getRoster(),
+          roster: this.opts.getRoster(), tip_hash: this.opts.getTipHash(),
         }))
       } catch { /* dropped on next heartbeat */ }
     }

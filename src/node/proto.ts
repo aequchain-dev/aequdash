@@ -88,10 +88,10 @@ export interface PeerInfo {
 }
 
 export type MeshMessage =
-  | { type: "hello"; id: string; host: string; port: number; pub: string; height: number; state_root: string; genesis_hash: string; roster: string[] }
-  | { type: "hello_ack"; id: string; host: string; port: number; pub: string; height: number; state_root: string; roster: string[] }
-  | { type: "ping"; id: string; ts: number; height: number; state_root: string; roster: string[] }
-  | { type: "pong"; id: string; ts: number; height: number; state_root: string; roster: string[] }
+  | { type: "hello"; id: string; host: string; port: number; pub: string; height: number; state_root: string; genesis_hash: string; roster: string[]; tip_hash?: string; auth?: string }
+  | { type: "hello_ack"; id: string; host: string; port: number; pub: string; height: number; state_root: string; roster: string[]; tip_hash?: string; auth?: string }
+  | { type: "ping"; id: string; ts: number; height: number; state_root: string; roster: string[]; tip_hash?: string }
+  | { type: "pong"; id: string; ts: number; height: number; state_root: string; roster: string[]; tip_hash?: string }
   | { type: "tx"; tx: Tx }
   | { type: "proposal"; block: Block; sig: string; pub: string }
   | { type: "vote"; vote: Vote }

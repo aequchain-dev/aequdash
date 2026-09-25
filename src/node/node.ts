@@ -52,6 +52,10 @@ export interface AequNodeConfig {
   identity?: Identity
   seedTxs?: Tx[]                   // genesis burst (injected into block 1 by bootstrap node)
   bootstrap?: boolean              // this node carries the seed txs
+  /** Invite-gated admission: peers must prove this token in hello/hello_ack. */
+  token?: string
+  /** TLS for all mesh links (cert/key PEM or paths). All peers must agree. */
+  peerTls?: { cert: string; key: string }
   nowFn?: () => number             // test hook
 }
 
@@ -127,6 +131,7 @@ export class AequNode extends EventEmitter {
       seeds: this.cfg.seeds,
       getHeight: () => this.height,
       getStateRoot: () => this.tipStateRoot(),
+      getTipHash: () => this.tipHash,
       getRoster: () => this.roster(),
       callbacks: {
         onMessage: (peer, msg) => this.onMeshMessage(peer, msg),
@@ -134,6 +139,8 @@ export class AequNode extends EventEmitter {
         onPeerDown: (id, reason) => this.onPeerDown(id, reason),
       },
       nowFn: this.cfg.nowFn,
+      token: this.cfg.token,
+      tls: this.cfg.peerTls,
     })
     this.boundPort = await this.mesh.start()
     this.running = true
@@ -183,9 +190,21 @@ export class AequNode extends EventEmitter {
 
   // ── Derived consensus state ────────────────────────────────────────────────
 
-  /** Live validator roster: self + live peers, sorted. */
+  /**
+   * Live validator roster: self + live CAUGHT-UP peers, sorted.
+   *
+   * Catch-up filter (p.height + 1 >= this.height): a peer materially behind
+   * our tip is excluded from the roster until it syncs. Without this, a fresh
+   * internet joiner at height 0 would immediately enter committees and stall
+   * QC formation (its votes never arrive). Self is always included — whether
+   * self actually proposes/votes is gated separately by consensusEnabled and
+   * isSynced() at round time. At genesis every height is 0, so the filter is
+   * a no-op there; it only bites once the chain has advanced.
+   */
   roster(): string[] {
-    const ids = [this.cfg.nodeId, ...(this.mesh?.livePeers().map((p) => p.id) ?? [])]
+    const peers = this.mesh?.livePeers() ?? []
+    const eligible = peers.filter((p) => p.height + 1 >= this.height)
+    const ids = [this.cfg.nodeId, ...eligible.map((p) => p.id)]
     return [...new Set(ids)].sort()
   }
 
@@ -222,6 +241,10 @@ export class AequNode extends EventEmitter {
    */
   private roundTick(): void {
     if (!this.running || !this.consensusEnabled || !this.mesh) return
+    // Partition reconciliation: if any peer sits at OUR height on a DIFFERENT
+    // tip, the chains diverged (e.g. two simultaneous solo genesis anchors).
+    // Resolve deterministically before proposing on top of a losing tip.
+    for (const p of this.mesh.livePeers()) this.maybeResolveTipFork(p)
     const nextHeight = this.height + 1
     const committee = this.committee(nextHeight)
     if (committee.length === 0) return
@@ -449,7 +472,7 @@ export class AequNode extends EventEmitter {
         })
         return
       }
-      case "sync_response": return this.handleSyncResponse(msg.blocks, msg.qcs)
+      case "sync_response": return this.handleSyncResponse(peer, msg.blocks, msg.qcs)
       default: return
     }
   }
@@ -457,8 +480,9 @@ export class AequNode extends EventEmitter {
   private handleCommitMsg(peer: PeerState, block: Block, qc: QC): void {
     if (block.header.height <= this.height) return // already have it
     if (block.header.height > this.height + 1) {
-      // We're behind: pull the gap from the peer who told us
-      this.mesh?.sendTo(peer.id, { type: "sync_request", from_height: this.height + 1 })
+      // We're behind: pull the gap from the peer who told us — INCLUDING our
+      // own tip height, so a divergent chain is detected (not applied blind).
+      this.mesh?.sendTo(peer.id, { type: "sync_request", from_height: this.height })
       return
     }
     const committee = selectCommittee(block.header.roster, block.header.height, this.cfg.epochSeed, this.cfg.committeeSize)
@@ -468,8 +492,24 @@ export class AequNode extends EventEmitter {
     this.commit(block, qc)
   }
 
-  private handleSyncResponse(blocks: Block[], qcs: QC[]): void {
+  private handleSyncResponse(peer: PeerState, blocks: Block[], qcs: QC[]): void {
     const byHeight = new Map(qcs.map((q) => [q.height, q]))
+    // DIVERGENCE CHECK: if the response contains the peer's version of OUR
+    // tip block and the hash differs, we are on a fork (e.g. two solo
+    // genesis anchors that met late). Our chain cannot extend theirs, and
+    // waiting for votes across both chains deadlocks the shared committee.
+    // The BEHIND node (that's us — we asked for sync) wipes to genesis and
+    // re-pulls from 1. Deterministic: only the requester ever wipes.
+    for (const block of blocks) {
+      if (block.header.height === this.height && this.height > 0 && block.hash !== this.tipHash) {
+        this.emitActivity("fork_resolve", `Chain diverged from ${peer.id} at our tip (height ${this.height}) — wiping to re-sync`, "warn", [
+          { k: "peer_tip", v: block.hash.slice(0, 12) },
+        ])
+        this.wipeChainState()
+        this.mesh?.sendTo(peer.id, { type: "sync_request", from_height: 1 })
+        return
+      }
+    }
     for (const block of blocks.sort((a, b) => a.header.height - b.header.height)) {
       if (block.header.height !== this.height + 1) continue
       const qc = byHeight.get(block.header.height)
@@ -482,14 +522,56 @@ export class AequNode extends EventEmitter {
 
   // ── Peer lifecycle ─────────────────────────────────────────────────────────
 
+  /**
+   * Deterministic fork resolution for same-height divergent tips.
+   *
+   * When could this happen? Two nodes that BOTH bootstrap a network solo
+   * (each alone at genesis, threshold 1) commit different block-1 hashes —
+   * identical state roots (same seed txs) but different proposer/ts, so the
+   * tips differ and neither can extend the other's chain. Once they connect,
+   * both sides independently compute the winner: the LEXICOGRAPHICALLY
+   * SMALLER tip hash survives; the loser wipes back to genesis and re-syncs.
+   * No coordination, no votes — convergent by construction.
+   */
+  private maybeResolveTipFork(peer: PeerState): void {
+    if (!this.running) return
+    if (this.height === 0 || peer.height === 0) return // nothing to reconcile yet
+    if (peer.height !== this.height) return            // normal sync handles leads/lags
+    if (!peer.tipHash || peer.tipHash === this.tipHash) return
+    if (this.tipHash > peer.tipHash) {
+      this.emitActivity("fork_resolve", `Divergent tip at height ${this.height} — wiping local chain to re-sync from ${peer.id}`, "warn", [
+        { k: "peer_tip", v: peer.tipHash.slice(0, 12) },
+      ])
+      this.wipeChainState()
+      this.mesh?.sendTo(peer.id, { type: "sync_request", from_height: 1 })
+    }
+    // If we hold the smaller tip, the peer wipes on its own evaluation.
+  }
+
+  /** Wipe chain state back to empty genesis, keeping the node running. */
+  private wipeChainState(): void {
+    this.ledger = new Ledger()
+    this.blocks = []
+    this.qcs = []
+    this.height = 0
+    this.tipHash = ZERO_HASH
+    this.view = 0
+    this.proposal = null
+    this.mempool.clear()
+  }
+
   private onPeerUp(peer: PeerState): void {
     this.emitActivity("peer_up", `Peer ${peer.id} connected (${peer.host}:${peer.port})`, "success", [
       { k: "peers", v: String((this.mesh?.peerCount() ?? 0)) },
     ])
     this.emit("peer", { id: peer.id, up: true })
     if (peer.height > this.height) {
-      this.mesh?.sendTo(peer.id, { type: "sync_request", from_height: this.height + 1 })
+      // Request from OUR OWN tip (not tip+1): the response then includes the
+      // peer's version of our tip block, letting handleSyncResponse DETECT a
+      // divergent fork instead of blindly applying an incompatible chain.
+      this.mesh?.sendTo(peer.id, { type: "sync_request", from_height: this.height })
     }
+    this.maybeResolveTipFork(peer)
   }
 
   private onPeerDown(id: string, reason: string): void {

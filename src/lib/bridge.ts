@@ -29,6 +29,7 @@ import { EventEmitter } from "node:events"
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process"
 import type { Socket } from "bun"
 import { AequSimulator, backendNowMs } from "./simulator.ts"
+import { SoloNodeBackend, type SoloNodeConfig } from "../node/solo.ts"
 import type {
   ActivityEvent,
   ActivityLevel,
@@ -60,6 +61,13 @@ export interface BridgeOptions {
   token?: string
   /** Use TLS when attaching to the gateway (required for internet exposure). */
   tls?: boolean
+  /**
+   * SOLO mode (the internet-first default): this instance IS one real
+   * AequNode, in-process. No gateway, no control socket — the TUI talks to
+   * its own node, and the node meshes with peers over TCP. When set, the
+   * aeqnet backend runs solo instead of spawning/attaching to a gateway.
+   */
+  solo?: SoloNodeConfig
 }
 
 interface PendingRequest {
@@ -92,6 +100,8 @@ export class Bridge extends EventEmitter {
   private activityBuffer: ActivityEvent[] = []
   /** True once the aeqnet gateway has announced readiness over the wire. */
   private meshReady = false
+  /** Solo mode: the in-process node backend (instance-is-node). */
+  private solo: SoloNodeBackend | null = null
 
   constructor(opts: BridgeOptions) {
     super()
@@ -117,7 +127,40 @@ export class Bridge extends EventEmitter {
         "Julia",
         { JULIA_LOAD_PATH: "@:@v#.#:@stdlib" },
       )
-      case "aeqnet": return this.startAeqnetMesh()
+      case "aeqnet": return this.options.solo ? this.startSoloAeqnet() : this.startAeqnetMesh()
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // aeqnet SOLO — this instance IS one real node (internet-first default)
+  //
+  // No gateway, no control socket, no daemon tree. The TUI's process hosts
+  // a single AequNode that joins (or founds) a shared mesh as a genuine
+  // consensus peer. Quitting the TUI destroys the node; the network lives
+  // while other peers remain; when the last peer exits, the chain is gone.
+  // ─────────────────────────────────────────────────────────────────────────
+
+  private async startSoloAeqnet(): Promise<void> {
+    this.setStatus("starting")
+    const cfg = this.options.solo!
+    this.emitRaw(`Starting aequdash node "${cfg.nodeId}" on net ${cfg.clusterId}${cfg.token ? " (invite-gated)" : " (open)"}…`, "stdout", "info")
+    if (cfg.seeds.length > 0) {
+      this.emitRaw(`Joining via ${cfg.seeds.length} seed(s): ${cfg.seeds.map((s) => `${s.host}:${s.port}`).join(", ")}`, "stdout", "info")
+    }
+    try {
+      this.solo = new SoloNodeBackend(cfg)
+      this.solo.onActivity((ev) => this.emitActivity(ev))
+      const { endpoint } = await this.solo.start()
+      this.meshReady = true
+      this.emitRaw(
+        `rpc: hello — aeqnet node ready (net=${cfg.clusterId}, endpoint=${endpoint.host}:${endpoint.port}, version=${this.solo.version})`,
+        "rpc",
+        "success",
+      )
+      this.setStatus("ready")
+    } catch (e) {
+      this.solo = null
+      return this.failBackend(`solo node failed to start: ${(e as Error).message}`)
     }
   }
 
@@ -368,6 +411,12 @@ export class Bridge extends EventEmitter {
   async stop(): Promise<void> {
     this.setStatus("stopped")
     if (this.sim) { this.sim.stop(); this.sim = null }
+    // solo: quitting the TUI destroys OUR node (state evaporates with us).
+    if (this.solo) {
+      try { await this.solo.shutdown() } catch { /* ignore */ }
+      this.solo = null
+      return
+    }
     // aeqnet: detach this client from the shared mesh. The gateway owns the
     // mesh and evaporates it only when the LAST client disconnects — so a
     // single TUI quitting leaves a shared mesh alive for the others.
@@ -386,6 +435,7 @@ export class Bridge extends EventEmitter {
   }
 
   kill(): void {
+    if (this.solo) { try { void this.solo.shutdown() } catch { /* ignore */ } ; this.solo = null; return }
     if (this.sock) { try { this.sock.end() } catch { /* ignore */ } ; this.sock = null; return }
     try { this.proc?.kill("SIGKILL") } catch { /* ignore */ }
   }
@@ -398,6 +448,13 @@ export class Bridge extends EventEmitter {
   async terminateMesh(): Promise<void> {
     this.setStatus("stopped")
     if (this.sim) { this.sim.stop(); this.sim = null; return }
+    // solo: we can only destroy OUR OWN node — other peers own their state.
+    // The network evaporates when the last peer does the same.
+    if (this.solo) {
+      try { await this.solo.shutdown() } catch { /* ignore */ }
+      this.solo = null
+      return
+    }
     if (this.sock) {
       try { await this.call("shutdown", undefined, 3_000) } catch { /* ignore */ }
       try { this.sock.end() } catch { /* ignore */ }
@@ -412,6 +469,29 @@ export class Bridge extends EventEmitter {
   // ─────────────────────────────────────────────────────────────────────────
 
   async call<T = unknown>(method: string, params?: unknown, timeoutMs = REQUEST_TIMEOUT_MS): Promise<T> {
+    // Solo node: serve the JSON-RPC surface in-process (no socket involved).
+    if (this.solo) {
+      switch (method) {
+        case "state.snapshot":
+        case "state.snapshot.v2":
+          return this.solo.snapshot() as unknown as T
+        case "cli.run": {
+          const p = params as { command?: string; args?: string[] }
+          return (await this.solo.cliRun(String(p?.command ?? ""), Array.isArray(p?.args) ? p.args.map(String) : [])) as unknown as T
+        }
+        case "net.nodes":
+          return this.solo.clusterInfo() as unknown as T
+        case "net.invite":
+          return this.solo.inviteInfo() as unknown as T
+        case "net.clients":
+          return { clients: 1, mesh_ready: this.meshReady } as unknown as T
+        case "shutdown":
+          await this.solo.shutdown()
+          return { ok: true } as unknown as T
+        default:
+          throw new Error(`unknown method: ${method}`)
+      }
+    }
     if (this.backend === "sim" && this.sim) {
       if (method === "state.snapshot" || method === "state.snapshot.v2") return this.sim.snapshot() as unknown as T
       if (method === "cli.run") {

@@ -25,6 +25,11 @@ import { AequNode } from "./node.ts"
 import { demoSeedTxs } from "./genesis.ts"
 import { buildSnapshot } from "./snapshot.ts"
 import { NODE_VERSION, type ClusterInfo } from "./proto.ts"
+import {
+  runCliCommand,
+  type CommandResult,
+  type CommanderHost,
+} from "./commander.ts"
 import type { ActivityEvent } from "../lib/types.ts"
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -216,7 +221,6 @@ function onDaemonReady(handle: DaemonHandle): void {
 let node1: AequNode | null = null
 const activityLog: ActivityEvent[] = []
 const ACTIVITY_CAP = 500
-let commandNonce = 0
 
 /** When true, the mesh has finished booting and genesis has committed. */
 let meshReady = false
@@ -291,215 +295,19 @@ function emitLog(message: string, level: ActivityEvent["level"] = "info"): void 
 // Command execution — cli.run
 // ─────────────────────────────────────────────────────────────────────────────
 
-interface CommandResult {
-  ok: boolean
-  message: string
-  snapshot?: unknown
-}
-
-/** Wait until a tx id is committed to the chain (or timeout). */
-function waitForCommit(node: AequNode, txId: string, timeoutMs = 20_000): Promise<boolean> {
-  return new Promise((resolve) => {
-    const timer = setTimeout(() => { cleanup(); resolve(false) }, timeoutMs)
-    const onCommit = ({ block }: { block: { txs: { id: string }[] } }) => {
-      if (block.txs.some((t) => t.id === txId)) { cleanup(); resolve(true) }
-    }
-    const cleanup = () => { clearTimeout(timer); node.off("commit", onCommit) }
-    node.on("commit", onCommit)
-  })
-}
-
-async function runTxCommand(command: string, actor: string, payload: Record<string, unknown>, session: { currentUser: string }): Promise<CommandResult> {
-  if (!node1 || !node1.running) return { ok: false, message: "node not running" }
-  const nonce = Date.now() * 1000 + (commandNonce++ % 1000)
-  try {
-    const tx = node1.submitTx(command as never, actor, payload, Date.now(), nonce)
-    emitActivity("tx_submit", `${command} submitted by ${actor}`, "info", [{ k: "tx", v: tx.id.slice(0, 12) }])
-    const committed = await waitForCommit(node1, tx.id)
-    if (!committed) return { ok: false, message: `${command}: commit timeout` }
-    return { ok: true, message: `${command} committed`, snapshot: currentSnapshot(session) }
-  } catch (e) {
-    return { ok: false, message: (e as Error).message }
-  }
+/** The gateway as a CommanderHost: node-1 + daemons + shared sessions. */
+const gatewayHost: CommanderHost = {
+  node: () => node1,
+  currentSnapshot: (session) => currentSnapshot(session),
+  emitActivity: (tag, message, level, fields) => emitActivity(tag, message, level, fields),
+  clusterInfo: () => clusterInfo(),
+  stopNode: (id, session) => stopNode(id, session),
+  startNode: (id, session) => startNode(id, session),
+  resetCluster: (session) => resetCluster(session),
 }
 
 async function cliRun(command: string, args: string[], session: { currentUser: string }): Promise<CommandResult> {
-  const cmd = command.toLowerCase()
-  const actor = session.currentUser || "founder"
-
-  switch (cmd) {
-    // ── Session (local, not replicated) ──
-    case "login": {
-      const id = args[0]
-      if (!id) return { ok: false, message: "usage: login <member_id>" }
-      if (!node1?.ledger.members.has(id)) return { ok: false, message: `no such member: ${id}` }
-      session.currentUser = id
-      emitActivity("auth", `Logged in as ${id}`, "success")
-      return { ok: true, message: `logged in as ${id}`, snapshot: currentSnapshot(session) }
-    }
-    case "logout": {
-      session.currentUser = ""
-      emitActivity("auth", "Logged out", "info")
-      return { ok: true, message: "logged out", snapshot: currentSnapshot(session) }
-    }
-
-    // ── Member ops (replicated) ──
-    case "join": {
-      const [id, deposit] = args
-      if (!id) return { ok: false, message: "usage: join <id> [deposit]" }
-      return runTxCommand("join", "system", { id, deposit: deposit ?? "0", region: "Unspecified", status: "active" }, session)
-    }
-    case "exit_member": {
-      if (!args[0]) return { ok: false, message: "usage: exit_member <id>" }
-      return runTxCommand("exit_member", "system", { id: args[0] }, session)
-    }
-    case "withdraw": {
-      const [id, amount, ...rest] = args
-      if (!id || !amount) return { ok: false, message: "usage: withdraw <id> <amount> [purpose]" }
-      return runTxCommand("withdraw", id, { id, amount, purpose: rest.join(" ") || "withdrawal" }, session)
-    }
-
-    // ── Networks ──
-    case "create_net": {
-      const [name, denom, rate] = args
-      if (!name || !denom || !rate) return { ok: false, message: "usage: create_net <name> <denom> <rate>" }
-      return runTxCommand("create_net", actor, { name, denom, rate }, session)
-    }
-    case "join_net": {
-      const [member, net] = args
-      if (!member || !net) return { ok: false, message: "usage: join_net <member> <net>" }
-      return runTxCommand("join_net", actor, { member, net }, session)
-    }
-    case "transfer_net": {
-      const [member, from, to] = args
-      if (!member || !from || !to) return { ok: false, message: "usage: transfer_net <member> <from> <to>" }
-      return runTxCommand("transfer_net", actor, { member, from, to }, session)
-    }
-
-    // ── Businesses ──
-    case "create_bus": {
-      const [name, net, ec] = args
-      if (!name || !net) return { ok: false, message: "usage: create_bus <name> <net> [ec]" }
-      return runTxCommand("create_bus", actor, { name, net, ec: ec ?? "0.02" }, session)
-    }
-    case "set_ec": {
-      const [bus, rate] = args
-      if (!bus || !rate) return { ok: false, message: "usage: set_ec <bus> <rate>" }
-      return runTxCommand("set_ec", actor, { bus, rate }, session)
-    }
-    case "hire": {
-      const [bus, member] = args
-      if (!bus || !member) return { ok: false, message: "usage: hire <bus> <member>" }
-      return runTxCommand("hire", actor, { bus, member }, session)
-    }
-    case "bus_withdraw": {
-      const [bus, amount, ...rest] = args
-      if (!bus || !amount) return { ok: false, message: "usage: bus_withdraw <bus> <amount> [purpose]" }
-      return runTxCommand("bus_withdraw", actor, { bus, amount, purpose: rest.join(" ") || "business withdrawal" }, session)
-    }
-
-    // ── Pledges ──
-    case "create_pledge": {
-      const [name, target, net, ...rest] = args
-      if (!name || !target || !net) return { ok: false, message: "usage: create_pledge <name> <target> <net> [purpose]" }
-      return runTxCommand("create_pledge", actor, { name, target, net, purpose: rest.join(" ") || "—", category: "Other" }, session)
-    }
-    case "support": {
-      const [pledge, amount] = args
-      if (!pledge || !amount) return { ok: false, message: "usage: support <pledge> <amount>" }
-      return runTxCommand("support", actor, { pledge, amount }, session)
-    }
-
-    // ── Payment layer ──
-    case "node_register": {
-      const [account, balance] = args
-      if (!account || !balance) return { ok: false, message: "usage: node_register <account> <balance>" }
-      return runTxCommand("node_register", actor, { account, balance }, session)
-    }
-    case "node_pay": {
-      const [from, to, amount] = args
-      if (!from || !to || !amount) return { ok: false, message: "usage: node_pay <from> <to> <amount>" }
-      return runTxCommand("node_pay", actor, { from, to, amount }, session)
-    }
-
-    // ── Cluster lifecycle (gateway-local) ──
-    case "node_init": {
-      // Reconfigure committee/threshold — requires cluster restart
-      return { ok: false, message: "node_init: restart the TUI with AEQUCHAIN_NODES/committee env to reconfigure (ephemeral mesh boots pre-configured)" }
-    }
-    case "node_stop": {
-      const id = args[0]
-      if (!id) return { ok: false, message: "usage: node_stop <node_id>" }
-      return stopNode(id, session)
-    }
-    case "node_start": {
-      const id = args[0]
-      if (!id) return { ok: false, message: "usage: node_start <node_id>" }
-      return startNode(id, session)
-    }
-    case "net_nodes": {
-      const info = clusterInfo()
-      return { ok: true, message: `${info.mesh_size} live node(s): ${info.nodes.map((n) => n.id).join(", ")}`, snapshot: currentSnapshot(session) }
-    }
-    case "node_reset":
-    case "reset": {
-      return resetCluster(session)
-    }
-
-    // ── Reports (computed live from state) ──
-    case "node_status": {
-      const n = node1
-      if (!n) return { ok: false, message: "node not running" }
-      return {
-        ok: true,
-        message: `height ${n.height} · peers ${n.mesh?.peerCount() ?? 0} · accounts ${n.ledger.accounts.size} · mempool ${n.mempool.size}`,
-        snapshot: currentSnapshot(session),
-      }
-    }
-    case "equality_check": {
-      const eq = node1?.ledger.equalityReport()
-      if (!eq) return { ok: false, message: "node not running" }
-      emitActivity("equality_check", eq.allPassed ? "Equidistribution check passed" : "EQUALITY VIOLATION", eq.allPassed ? "success" : "error", [
-        { k: "members", v: String(eq.totalMembers) },
-        { k: "variance", v: String(eq.variance) },
-      ])
-      return { ok: eq.allPassed, message: eq.allPassed ? `equality verified for ${eq.totalMembers} members` : "EQUALITY VIOLATION", snapshot: currentSnapshot(session) }
-    }
-    case "consensus_test": {
-      const snap = currentSnapshot(session)
-      const c = snap?.consensus
-      if (!c) return { ok: false, message: "node not running" }
-      emitActivity("consensus_test", c.passed ? "Consensus healthy" : "CONSENSUS DEGRADED", c.passed ? "success" : "error", [
-        { k: "committee", v: String(c.committee_size) },
-        { k: "round", v: String(c.round) },
-      ])
-      return { ok: c.passed, message: c.passed ? "consensus healthy" : "consensus degraded", snapshot: snap }
-    }
-
-    case "demo":
-    case "status": {
-      const s = currentSnapshot(session)
-      return {
-        ok: true,
-        message: `${s?.members_summary?.total_registered ?? 0} members · height ${s?.block_height ?? 0} · ${clusterInfo().mesh_size} nodes`,
-        snapshot: s,
-      }
-    }
-    case "help": {
-      const mesh = clusterInfo()
-      emitActivity("help", "Command help", "info", [
-        { k: "mesh", v: `${mesh.mesh_size} nodes` },
-      ])
-      return {
-        ok: true,
-        message: "identity: login/logout/join/withdraw · networks: create_net/join_net/transfer_net · business: create_bus/hire/bus_withdraw · pledges: create_pledge/support · mesh: node_stop/node_start/net_nodes/reset · checks: equality_check/consensus_test · exit: kill",
-        snapshot: currentSnapshot(session),
-      }
-    }
-
-    default:
-      return { ok: false, message: `unknown command: ${cmd}` }
-  }
+  return runCliCommand(gatewayHost, command, args, session)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

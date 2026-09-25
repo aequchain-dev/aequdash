@@ -7,6 +7,7 @@
  * grammar.
  */
 
+import { useEffect, useState } from "react"
 import { useTerminalDimensions } from "@opentui/react"
 import { useStore } from "../state/store.tsx"
 import { THEME, fmt0, fmt2, fmtBytes, fmtMs, fmtTps, shortHash } from "../lib/theme.ts"
@@ -14,14 +15,33 @@ import { Panel, panelInnerWidth } from "../components/Panel.tsx"
 import { DataRow, StatSplit } from "../components/DataRow.tsx"
 import { Table, type Column } from "../components/Table.tsx"
 import { T } from "../components/T.tsx"
+import { Qr } from "../components/Qr.tsx"
 import type { NodeAccount, BlockV2, ClusterNodeInfo } from "../lib/types.ts"
 
+interface InviteInfo {
+  code: string | null
+  endpoint: string
+  clusterId: string
+  gated: boolean
+}
+
 export function Node() {
-  const { snapshot } = useStore()
+  const { snapshot, bridge } = useStore()
   const { width: tw } = useTerminalDimensions()
   const w = Math.max(24, tw - 6)
   const iw = panelInnerWidth(w)
   const half = Math.floor((w - 1) / 2)
+
+  // Solo nodes publish their join coordinates; gateways/simulators answer
+  // net.invite with an error, which we swallow (no panel for those backends).
+  const [invite, setInvite] = useState<InviteInfo | null>(null)
+  useEffect(() => {
+    let alive = true
+    bridge.call("net.invite")
+      .then((v) => { if (alive && v && typeof v === "object") setInvite(v as InviteInfo) })
+      .catch(() => {})
+    return () => { alive = false }
+  }, [bridge])
 
   if (!snapshot) return <Panel title="Node" meta="Testnet" width={w}><T color={THEME.ink.faint}>{"loading…"}</T></Panel>
   const node = snapshot.node
@@ -83,6 +103,34 @@ export function Node() {
           </Panel>
         </box>
         <box height={1} />
+        {invite && (
+          <>
+            <Panel
+              title="Network & Invite"
+              meta={invite.gated ? "invite-gated" : "open"}
+              width={w}
+            >
+              <DataRow label="Network" value={invite.clusterId} width={iw} />
+              <DataRow label="Endpoint" value={invite.endpoint} width={iw} />
+              <DataRow
+                label="Join as peer"
+                value={invite.code ?? `aequdash join ${invite.endpoint}`}
+                width={iw}
+              />
+              {invite.code && (
+                <>
+                  <T color={THEME.ink.faint}>{"scan to join — the network lives only while peers do:"}</T>
+                  <box height={1} />
+                  <Qr text={invite.code} />
+                </>
+              )}
+              {!invite.code && (
+                <T color={THEME.ink.faint}>{"share the endpoint above — anyone dialing it joins as a real peer"}</T>
+              )}
+            </Panel>
+            <box height={1} />
+          </>
+        )}
         {cluster && (
           <>
             <Panel

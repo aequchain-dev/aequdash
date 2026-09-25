@@ -9,3 +9,7 @@ aequdash
 aequdash.exe
 # Tooling state
 .serena/
+# TLS material (never commit keys/certs — tests generate their own)
+cert.pem
+key.pem
+*.key.pem

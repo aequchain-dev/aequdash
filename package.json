@@ -1,7 +1,7 @@
 {
   "name": "aequdash",
   "version": "2.0.0",
-  "description": "aequdash — aequchain TUI v2. Calm, engineered instrument console for the aequchain ephemeral testnet. OpenTUI + React + Bun.",
+  "description": "aequdash — aequchain TUI v2. Calm, engineered instrument console — and a REAL ephemeral testnet node. Run it and you ARE the network: first user anchors, later users join as peers, last exit erases the chain. OpenTUI + React + Bun.",
   "type": "module",
   "module": "src/App.tsx",
   "bin": {
@@ -11,8 +11,10 @@
     "start": "bun run bin/aequdash.tsx",
     "start:julia": "AEQUCHAIN_BACKEND=julia bun run bin/aequdash.tsx",
     "start:sim": "AEQUCHAIN_SIMULATE=1 bun run bin/aequdash.tsx",
+    "start:local": "bun run bin/aequdash.tsx --local",
     "dev": "bun --watch bin/aequdash.tsx",
     "node": "bun run src/node/gateway.ts",
+    "rendezvous": "bun run scripts/rendezvous.ts",
     "typecheck": "tsc --noEmit",
     "test": "bun test tests/",
     "snapshot": "bun run scripts/snapshot.tsx",
@@ -20,11 +22,13 @@
   },
   "dependencies": {
     "@opentui/react": "^0.4.1",
+    "qrcode": "^1.5.4",
     "react": "19.2.2",
     "react-dom": "19.2.2"
   },
   "devDependencies": {
     "@types/bun": "^1.1.10",
+    "@types/qrcode": "^1.5.6",
     "@types/react": "^18.3.5",
     "typescript": "^5.6.2"
   },
