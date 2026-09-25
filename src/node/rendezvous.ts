@@ -49,7 +49,7 @@ export function netKey(clusterId: string): string {
 export class RendezvousClient {
   private servers: { host: string; port: number }[]
   private clusterId: string
-  private endpoint: RendezvousEndpoint
+  private endpointFor: (serverHost: string) => RendezvousEndpoint
   private nodeId: string
   private timer: ReturnType<typeof setInterval> | null = null
   private logFn: (msg: string) => void
@@ -58,7 +58,12 @@ export class RendezvousClient {
     /** One or more "host:port" rendezvous addresses (redundancy: register to ALL, lookup merges). */
     server: string | string[]
     clusterId: string
-    endpoint: RendezvousEndpoint   // OUR externally dialable endpoint
+    /**
+     * OUR dialable endpoint — either fixed, or resolved PER SERVER (e.g. the
+     * loopback registry gets 127.0.0.1:port; internet registries get the
+     * public address). The resolver receives the registry's host.
+     */
+    endpoint: RendezvousEndpoint | ((serverHost: string) => RendezvousEndpoint)
     nodeId: string
     log?: (msg: string) => void
   }) {
@@ -74,7 +79,9 @@ export class RendezvousClient {
       return { host: s.slice(0, ci), port }
     })
     this.clusterId = opts.clusterId
-    this.endpoint = opts.endpoint
+    this.endpointFor = typeof opts.endpoint === "function"
+      ? opts.endpoint
+      : () => opts.endpoint as RendezvousEndpoint
     this.nodeId = opts.nodeId
     this.logFn = opts.log ?? (() => {})
   }
@@ -137,12 +144,19 @@ export class RendezvousClient {
   }
 
   private async register(): Promise<void> {
-    const results = await this.requestAll({
-      op: "register",
-      net: netKey(this.clusterId),
-      endpoint: `${this.endpoint.host}:${this.endpoint.port}`,
-      node: this.nodeId,
-    })
+    // Resolve the advertised endpoint PER SERVER (loopback registry gets the
+    // loopback address; internet registries get the public one).
+    const results = await Promise.all(
+      this.servers.map((s) => {
+        const ep = this.endpointFor(s.host)
+        return this.requestTo(s, {
+          op: "register",
+          net: netKey(this.clusterId),
+          endpoint: `${ep.host}:${ep.port}`,
+          node: this.nodeId,
+        }).catch(() => null)
+      }),
+    ).then((rs) => rs.filter((r): r is Record<string, unknown> => r !== null))
     if (results.length === 0) this.logFn("rendezvous register failed on all servers")
     for (const res of results) {
       if (res.ok !== true) this.logFn(`rendezvous register rejected: ${String(res.error ?? "?")}`)
@@ -153,11 +167,16 @@ export class RendezvousClient {
   async stop(): Promise<void> {
     if (this.timer) { clearInterval(this.timer); this.timer = null }
     try {
-      await this.requestAll({
-        op: "leave",
-        net: netKey(this.clusterId),
-        endpoint: `${this.endpoint.host}:${this.endpoint.port}`,
-      })
+      await Promise.all(
+        this.servers.map((s) => {
+          const ep = this.endpointFor(s.host)
+          return this.requestTo(s, {
+            op: "leave",
+            net: netKey(this.clusterId),
+            endpoint: `${ep.host}:${ep.port}`,
+          }).catch(() => null)
+        }),
+      )
     } catch { /* leaving is best-effort */ }
   }
 

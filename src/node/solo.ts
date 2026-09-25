@@ -18,7 +18,6 @@
  * join, withdraw, create_net, …) works identically to the --local dev mesh.
  */
 
-import os from "node:os"
 import { AequNode } from "./node.ts"
 import { demoSeedTxs } from "./genesis.ts"
 import { buildSnapshot } from "./snapshot.ts"
@@ -26,6 +25,7 @@ import { RendezvousClient } from "./rendezvous.ts"
 import { Registry } from "./registry.ts"
 import { LanBeacon } from "./beacon.ts"
 import { buildInvite } from "./invite.ts"
+import { guessOutboundHost, resolveAdvertisedHost } from "./netaddr.ts"
 import {
   runCliCommand,
   type CommandResult,
@@ -52,6 +52,13 @@ export interface SoloNodeConfig {
   roundTimeoutMs: number
   rendezvous?: string[]           // rendezvous server(s) "host:port" (redundant: register to all, lookup merges)
   dialAssistMs?: number           // rendezvous re-lookup cadence (default 20s; 0 disables)
+  /**
+   * Public-IP discovery override for tests: a function returning the WAN IP,
+   * or FALSE to skip discovery entirely (hermetic tests). Default: the real
+   * HTTPS echo-service discovery (only attempted when a public address is
+   * actually needed — external rendezvous configured or a named-net invite).
+   */
+  discoverPublic?: (() => Promise<string | null>) | false
   /**
    * Local (same-machine) discovery: this instance tries to HOST a tiny
    * loopback registry on 127.0.0.1:<localRegistryPort>. First binder wins;
@@ -141,22 +148,58 @@ export class SoloNodeBackend implements CommanderHost {
     return node
   }
 
-  /** Our dialable endpoint as others should see it. */
-  private advertisedEndpoint(port: number): { host: string; port: number } {
-    if (this.cfg.advertiseHost) return { host: this.cfg.advertiseHost, port }
-    if (this.cfg.host !== "0.0.0.0" && this.cfg.host !== "::") return { host: this.cfg.host, port }
-    return { host: guessOutboundHost(), port }
-  }
+  /** Our dialable endpoints, per scope: loopback / LAN / public. */
+  private endpoints: { loopback: { host: string; port: number }; lan: { host: string; port: number }; public: { host: string; port: number } } | null = null
 
   async start(): Promise<{ endpoint: { host: string; port: number } }> {
     this.nodeInst = this.buildNode()
     await this.nodeInst.start()
-    const endpoint = this.advertisedEndpoint(this.nodeInst.boundPort)
-    this.endpoint = endpoint
-    this.emitActivity("node_live", `Node ${this.cfg.nodeId} live on ${endpoint.host}:${endpoint.port}`, "success", [
+    const boundPort = this.nodeInst.boundPort
+
+    // ── Advertise the right address per scope — the user never sees an IP ──
+    //   loopback registry → 127.0.0.1   (same machine always dials loopback;
+    //                                    hairpin NAT would break public-IP dial)
+    //   LAN beacon        → LAN IP      (subnet peers dial the LAN address)
+    //   internet registry → public IP   (auto-discovered; zero configuration)
+    //   invite code       → public IP
+    const loopbackEp = { host: "127.0.0.1", port: boundPort }
+    const lanEp = {
+      host: this.cfg.host !== "0.0.0.0" && this.cfg.host !== "::" ? this.cfg.host : guessOutboundHost(),
+      port: boundPort,
+    }
+    const servers = this.rendezvousServers()
+    const hasExternalRegistry = servers.some((s) => !s.startsWith("127.0.0.1:") && !s.startsWith("localhost"))
+    const needPublic = hasExternalRegistry || !!this.cfg.inviteName || this.cfg.advertiseHost !== undefined
+    let publicEp = lanEp
+    let publicSource: string = "lan-guess"
+    if (needPublic && this.cfg.discoverPublic !== false) {
+      const r = await resolveAdvertisedHost({
+        scope: "public",
+        advertise: this.cfg.advertiseHost,
+        discover: typeof this.cfg.discoverPublic === "function" ? this.cfg.discoverPublic : undefined,
+      })
+      publicEp = { host: r.host, port: boundPort }
+      publicSource = r.source
+    } else if (this.cfg.advertiseHost && this.cfg.advertiseHost !== "auto") {
+      publicEp = { host: this.cfg.advertiseHost, port: boundPort }
+      publicSource = "explicit"
+    }
+    this.endpoints = { loopback: loopbackEp, lan: lanEp, public: publicEp }
+    this.endpoint = publicEp
+
+    this.emitActivity("node_live", `Node ${this.cfg.nodeId} live on ${loopbackEp.host}:${loopbackEp.port}`, "success", [
       { k: "net", v: this.cfg.clusterId },
       { k: "gated", v: this.cfg.token ? "yes" : "open" },
     ])
+    if (needPublic) {
+      if (publicSource === "discovered") {
+        this.emitActivity("advertise", `Public address auto-discovered: ${publicEp.host}:${publicEp.port} — no configuration needed`, "success")
+      } else if (publicSource === "explicit") {
+        this.emitActivity("advertise", `Advertising ${publicEp.host}:${publicEp.port} (AEQUCHAIN_ADVERTISE)`, "info")
+      } else {
+        this.emitActivity("advertise", `No public IP discoverable — advertising LAN address ${publicEp.host} to internet registries. Peers may not reach you inbound; dial-assist still discovers THEM (outbound works).`, "warn")
+      }
+    }
 
     // LOCAL DISCOVERY (same machine): try to host the loopback registry.
     // First instance binds it; later instances find it already running and
@@ -166,15 +209,14 @@ export class SoloNodeBackend implements CommanderHost {
 
     // Rendezvous client: ALWAYS runs (loopback registry is always in the
     // list), so zero-arg instances on one machine find each other with no
-    // configuration whatsoever. Register + keepalive means LATER joiners
-    // find us even after the original anchor leaves — "host exit" is a
-    // non-event by construction.
-    const servers = this.rendezvousServers()
+    // configuration whatsoever. The advertised endpoint resolves PER SERVER:
+    // loopback registry → 127.0.0.1; internet registries → public address.
     if (servers.length > 0) {
       this.rdv = new RendezvousClient({
         server: servers,
         clusterId: this.cfg.clusterId,
-        endpoint,
+        endpoint: (serverHost) =>
+          serverHost === "127.0.0.1" || serverHost === "localhost" ? loopbackEp : publicEp,
         nodeId: this.cfg.nodeId,
         log: (msg) => this.emitActivity("rendezvous", msg, "warn"),
       })
@@ -183,12 +225,13 @@ export class SoloNodeBackend implements CommanderHost {
       this.startDialAssist()
     }
 
-    // LAN DISCOVERY (different machines, same subnet): UDP beacon.
+    // LAN DISCOVERY (different machines, same subnet): UDP beacon advertises
+    // the LAN address — subnet peers can always dial it.
     if (this.cfg.beacon !== false) {
       this.beacon = new LanBeacon({
         clusterId: this.cfg.clusterId,
         nodeId: this.cfg.nodeId,
-        endpoint,
+        endpoint: lanEp,
         port: this.cfg.beaconPort,
         onPeer: (host, port, fromNode) => {
           const mesh = this.nodeInst?.mesh
@@ -230,7 +273,7 @@ export class SoloNodeBackend implements CommanderHost {
     if ((this.nodeInst.mesh?.peerCount() ?? 0) === 0 && !hasExternalDiscovery) {
       this.emitActivity(
         "discovery_hint",
-        "No peers on this machine or LAN. Internet discovery: run 'bun run rendezvous' on a reachable host, then AEQUCHAIN_RENDEZVOUS=HOST_IP:8930 on both sides — or share the invite from the Node screen (peer must be able to dial you).",
+        "No peers on this machine or LAN. Internet: run 'bun run rendezvous' on any reachable host, then AEQUCHAIN_RENDEZVOUS=HOST_IP:8930 on both sides — or share the invite on the Node screen (your public address is auto-discovered when possible).",
         "info",
       )
     }
@@ -238,18 +281,20 @@ export class SoloNodeBackend implements CommanderHost {
     this.nodeInst.enableConsensus()
 
     // Named networks: surface the shareable invite in the activity feed.
+    // The invite advertises the PUBLIC endpoint (auto-discovered — the user
+    // never has to know what an IP is).
     if (this.cfg.inviteName && this.cfg.inviteRand) {
       this.inviteCode = buildInvite({
         name: this.cfg.inviteName,
         rand: this.cfg.inviteRand,
         token: this.cfg.token,
-        endpoints: [endpoint],
+        endpoints: [publicEp],
       })
       this.emitActivity("invite", `Share to join this network: ${this.inviteCode}`, "success", [
         { k: "net", v: this.cfg.clusterId },
       ])
     }
-    return { endpoint }
+    return { endpoint: publicEp }
   }
 
   /**
@@ -285,10 +330,10 @@ export class SoloNodeBackend implements CommanderHost {
       }
     }
     if (!this.rdv) return
-    const endpoints = await this.rdv.lookup()
-    const selfEp = this.endpoint
-    for (const ep of endpoints) {
-      if (selfEp && ep.host === selfEp.host && ep.port === selfEp.port) continue
+    const found = await this.rdv.lookup()
+    const own = this.endpoints ? [this.endpoints.loopback, this.endpoints.public, this.endpoints.lan] : []
+    for (const ep of found) {
+      if (own.some((o) => o.host === ep.host && o.port === ep.port)) continue // never dial ourselves
       const already = this.nodeInst.mesh.livePeers().some((p) => p.host === ep.host && p.port === ep.port)
       if (!already) {
         this.emitActivity("dial_assist", `Dialing discovered peer ${ep.host}:${ep.port}`, "info")
@@ -400,13 +445,4 @@ export class SoloNodeBackend implements CommanderHost {
   }
 }
 
-/** Best-effort outbound IPv4 guess for advertise-when-bound-to-wildcard. */
-function guessOutboundHost(): string {
-  const ifaces = os.networkInterfaces()
-  for (const list of Object.values(ifaces)) {
-    for (const addr of list ?? []) {
-      if (addr.family === "IPv4" && !addr.internal) return addr.address
-    }
-  }
-  return "127.0.0.1"
-}
+/** guessOutboundHost moved to ./netaddr.ts (shared, tested). */

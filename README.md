@@ -89,6 +89,17 @@ nothing dialable needs the relay milestone (not shipped yet). And without
 any server at all, `aequdash new <name>` + the invite code (or
 `aequdash join HOST_IP:7920`) still works between two dialable endpoints.
 
+**You never have to know your IP.** When a public address is needed (an
+internet rendezvous is configured, or you create a named network with an
+invite), aequdash auto-discovers its public IPv4 via HTTPS echo services
+(2.5s each, first good answer wins) and advertises that. The address shown
+in the invite and the Node screen is always the best one for the scope:
+`127.0.0.1` for same-machine peers, the LAN address on the subnet beacon,
+the public address for the internet. Override only if you must:
+`AEQUCHAIN_ADVERTISE=1.2.3.4` (or `auto` to force discovery). If discovery
+fails (offline/firewalled), the activity feed says so — a LAN address is
+advertised instead, and dial-assist still works outbound.
+
 **Dial-assist.** Every node re-queries its registries every 20s and dials
 newly discovered endpoints. A stale invite (dead seeds, live network) heals
 itself: the joiner re-anchors briefly, discovers survivors, and the fork-heal
@@ -188,7 +199,7 @@ frames are byte-reproducible across runs and machines.
 | `AEQUCHAIN_RENDEZVOUS` | unset | Rendezvous server(s) `host:port` — comma-separate for redundancy |
 | `AEQUCHAIN_HOST` | `0.0.0.0` | Mesh bind host |
 | `AEQUCHAIN_PORT` | auto | Mesh bind port (unset = auto-assign) |
-| `AEQUCHAIN_ADVERTISE` | unset | External host for invites/registry when binding wildcard |
+| `AEQUCHAIN_ADVERTISE` | `auto` | Public address override; unset/`auto` = auto-discovered when needed |
 | `AEQUCHAIN_TOKEN` | unset | Network token (raw-endpoint join; or force one for `new`) |
 | `AEQUCHAIN_NODE_ID` | `aeqnode-<rand>` | Custom node id |
 | `AEQUCHAIN_BOOTSTRAP_DELAY_MS` | `3000` | Discovery grace before solo genesis |
