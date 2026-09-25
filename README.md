@@ -76,10 +76,10 @@ hash + optional network token) does the vetting.
 bun run rendezvous                       # listens on 0.0.0.0:8930
 
 # Then EVERYONE (both sides), replacing 203.0.113.10 with that host's real IP:
-AEQUCHAIN_RENDEZVOUS=203.0.113.10:8930 bun run start
+AEQUCHAIN_RENDEZVOUS=102.218.65.108:8930 bun run start
 
 # redundancy: comma-separate several — nodes register to ALL, lookups merge
-AEQUCHAIN_RENDEZVOUS=203.0.113.10:8930,198.51.100.7:8930 bun run start
+AEQUCHAIN_RENDEZVOUS=102.218.65.108:8930,198.51.100.7:8930 bun run start
 ```
 
 Note: at least ONE side of an internet rendezvous must be publicly dialable
