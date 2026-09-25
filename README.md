@@ -71,12 +71,23 @@ Discovery layers can only ever *find* peers; the mesh handshake (genesis
 hash + optional network token) does the vetting.
 
 ```bash
-# internet-wide discovery (optional; local and LAN already work):
+# internet-wide discovery (optional; local and LAN already work).
+# On any always-on, publicly reachable host:
 bun run rendezvous                       # listens on 0.0.0.0:8930
-AEQUCHAIN_RENDEZVOUS=rdv.example.com:8930 bun run start
+
+# Then EVERYONE (both sides), replacing 203.0.113.10 with that host's real IP:
+AEQUCHAIN_RENDEZVOUS=203.0.113.10:8930 bun run start
+
 # redundancy: comma-separate several — nodes register to ALL, lookups merge
-AEQUCHAIN_RENDEZVOUS=rdv1.example.com:8930,rdv2.example.com:8930 bun run start
+AEQUCHAIN_RENDEZVOUS=203.0.113.10:8930,198.51.100.7:8930 bun run start
 ```
+
+Note: at least ONE side of an internet rendezvous must be publicly dialable
+(open port / VPS). If only your peer is dialable, that's fine — dial-assist
+makes *you* discover and dial *them* outbound. Both sides behind NAT with
+nothing dialable needs the relay milestone (not shipped yet). And without
+any server at all, `aequdash new <name>` + the invite code (or
+`aequdash join HOST_IP:7920`) still works between two dialable endpoints.
 
 **Dial-assist.** Every node re-queries its registries every 20s and dials
 newly discovered endpoints. A stale invite (dead seeds, live network) heals

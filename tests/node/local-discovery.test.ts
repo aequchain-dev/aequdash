@@ -135,4 +135,15 @@ describe("zero-config local discovery", () => {
     const h = B.node()!.height
     await waitFor(() => B.node()!.height > h, 15_000, "B keeps committing after hosting takeover")
   }, 60_000)
+
+  test("alone with no internet-layer discovery → the feed says how to be found", async () => {
+    const A = new SoloNodeBackend(soloCfg("lone-node", []))
+    backends.push(A)
+    const events: string[] = []
+    A.onActivity((ev) => events.push(`${ev.tag}:${ev.message}`))
+    await A.start() // grace elapses with zero peers; loopback registry is not "external"
+    const hint = events.find((e) => e.startsWith("discovery_hint:"))
+    expect(hint).toBeTruthy()
+    expect(hint).toContain("AEQUCHAIN_RENDEZVOUS")
+  }, 30_000)
 })

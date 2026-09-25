@@ -222,6 +222,19 @@ export class SoloNodeBackend implements CommanderHost {
         : "No peers discovered — anchoring genesis solo", "info")
     }
 
+    // First-run honesty: alone after grace with no internet-layer discovery
+    // configured? Say exactly how to be found, once, in the activity feed.
+    const hasExternalDiscovery = (this.cfg.rendezvous ?? []).some(
+      (s) => !s.startsWith("127.0.0.1:") && !s.startsWith("localhost"),
+    )
+    if ((this.nodeInst.mesh?.peerCount() ?? 0) === 0 && !hasExternalDiscovery) {
+      this.emitActivity(
+        "discovery_hint",
+        "No peers on this machine or LAN. Internet discovery: run 'bun run rendezvous' on a reachable host, then AEQUCHAIN_RENDEZVOUS=HOST_IP:8930 on both sides — or share the invite from the Node screen (peer must be able to dial you).",
+        "info",
+      )
+    }
+
     this.nodeInst.enableConsensus()
 
     // Named networks: surface the shareable invite in the activity feed.
